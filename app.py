@@ -5,6 +5,8 @@ import os
 import io
 import tempfile
 import numpy as np
+from pydub import AudioSegment
+from pydub.utils import which
 
 from scipy.io import wavfile
 
@@ -20,6 +22,7 @@ app = FastAPI(title="Vocal Accompaniment Generator", version="0.1")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
+AudioSegment.converter = which("ffmpeg") or "/app/ffmpeg_bin/ffmpeg"
 
 @app.get("/")
 async def root_ui():
