@@ -11,6 +11,8 @@ from scipy.io import wavfile
 # extra imports for flexible decoding
 import soundfile as sf  # for wav/flac/ogg/aiff
 from pydub import AudioSegment  # for m4a/mp3/aac → wav
+from fastapi import FastAPI
+import install_ffmpeg  # noqa
 
 app = FastAPI(title="Vocal Accompaniment Generator", version="0.1")
 
