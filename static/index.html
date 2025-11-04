@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vocal Accompaniment Demo</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; max-width: 760px; }
+    .row { margin: 1rem 0; }
+    .btn { padding: .7rem 1rem; border: 0; border-radius: .5rem; background: #111; color: #fff; cursor: pointer; }
+    .select { padding: .6rem; border-radius: .5rem; border: 1px solid #ccc }
+  </style>
+</head>
+<body>
+  <h1>Vocal → Accompaniment</h1>
+  <p>Select a WAV vocal, pick a style, and generate a backing track.</p>
+
+  <div class="row">
+    <input type="file" id="file" accept="audio/wav" />
+  </div>
+
+  <div class="row">
+    <label for="style">Style:</label>
+    <select id="style" class="select">
+      <option value="afrobeat">Afrobeat</option>
+      <option value="hi_life">Hi Life</option>
+      <option value="hip_hop">Hip Hop</option>
+      <option value="calypso">Calypso</option>
+      <option value="reggae">Reggae</option>
+      <option value="rnb">R&amp;B</option>
+      <option value="classical">Classical</option>
+      <option value="davido_mix">Davido Mix</option>
+      <option value="nigerian_gospel">Nigerian Gospel</option>
+    </select>
+  </div>
+
+  <div class="row"><button class="btn" id="go">Generate</button></div>
+  <div id="msg"></div>
+  <div class="row"><audio id="player" controls></audio></div>
+
+  <script>
+    const go = document.getElementById('go');
+    go.onclick = async () => {
+      const f = document.getElementById('file').files[0];
+      const style = document.getElementById('style').value;
+      const msg = document.getElementById('msg');
+      msg.textContent = 'Generating...';
+      if (!f) { msg.textContent = 'Pick a WAV file first.'; return; }
+      const buf = await f.arrayBuffer();
+      const res = await fetch(`/generate?style=${style}`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/octet-stream'},
+        body: buf
+      });
+      if (!res.ok) { msg.textContent = 'Error: ' + (await res.text()); return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const player = document.getElementById('player');
+      player.src = url;
+      msg.textContent = 'Done!';
+    }
+  </script>
+</body>
+</html>
