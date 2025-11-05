@@ -16,13 +16,13 @@ from pydub import AudioSegment  # for m4a/mp3/aac → wav
 from fastapi import FastAPI
 import install_ffmpeg  # noqa
 
+AudioSegment.converter = which("ffmpeg") or "/app/ffmpeg_bin/ffmpeg"
+
 app = FastAPI(title="Vocal Accompaniment Generator", version="0.1")
 
 # Serve UI
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
-
-AudioSegment.converter = which("ffmpeg") or "/app/ffmpeg_bin/ffmpeg"
 
 @app.get("/")
 async def root_ui():
