@@ -33,38 +33,49 @@ SOUNDFONT_URL = "https://archive.org/download/fluidr3gm/FluidR3_GM.sf2"
 # Make pydub find ffmpeg (installed in Dockerfile)
 AudioSegment.converter = which("ffmpeg") or "/usr/bin/ffmpeg"
 
+
 # =========================================================
 # STYLE DEFINITIONS
 # =========================================================
-# Multiple afro progressions to rotate between
+
+# Expanded West African progressions
 AFRO_PROGRESSIONS = [
-    ["i", "v", "vi", "iv"],   # 1–5–6–4
-    ["i", "iv", "v", "iv"],   # 1–4–5–4
-    ["ii", "v", "i", "i"],    # 2–5–1
+    ["i", "v", "vi", "iv"],   # 1–5–6–4  (common afrobeats / gospel)
+    ["i", "iv", "v", "iv"],   # 1–4–5–4  (classic highlife)
+    ["ii", "v", "i", "i"],    # 2–5–1    (jazzy gospel)
+    ["i", "vi", "ii", "v"],   # 1–6–2–5  (gospel / soulful)
+    ["i", "v", "iv", "v"],    # 1–5–4–5  (afro-fusion)
+    ["i", "iv", "vi", "v"],   # 1–4–6–5  (pop feel)
 ]
 
 STYLE_SETTINGS = {
     "afrobeat": {
         "tempo_mult": 1.05,
         "progressions": AFRO_PROGRESSIONS,
-        "drum_pattern": "kick-snare",
+        "drum_pattern": "afro-groove",
+        "guitar_skank": False,
+    },
+    "hi_life": {
+        "tempo_mult": 1.10,
+        "progressions": [["i", "iv", "v", "iv"], ["i", "v", "vi", "iv"]],
+        "drum_pattern": "afro-groove",
         "guitar_skank": False,
     },
     "nigerian_gospel": {
         "tempo_mult": 1.03,
-        "progressions": [["i", "vi", "iv", "v"]],
+        "progressions": [["i", "vi", "iv", "v"], ["i", "vi", "ii", "v"]],
         "drum_pattern": "four-on-floor",
         "guitar_skank": False,
     },
     "reggae": {
         "tempo_mult": 0.90,
-        "progressions": [["i", "v", "iv", "v"]],
+        "progressions": [["i", "v", "iv", "v"], ["ii", "v", "i", "i"]],
         "drum_pattern": "one-drop",
-        "guitar_skank": True,   # reggae skank ON by default
+        "guitar_skank": True,  # off-beat guitar default
     },
     "rnb": {
         "tempo_mult": 0.95,
-        "progressions": [["i", "vi", "iv", "v"]],
+        "progressions": [["i", "vi", "iv", "v"], ["i", "vi", "ii", "v"]],
         "drum_pattern": "slow-groove",
         "guitar_skank": False,
     },
@@ -269,36 +280,71 @@ def render_midi_band(
                 break
         pm.instruments.append(bass)
 
-    # --- Drums ---
+# --- Drums ---
     if use_drums:
         drum = pretty_midi.Instrument(is_drum=True)
-        beat = 60.0 / bpm
+        beat = 60.0 / bpm           # 1 beat (quarter note)
+        half_beat = beat / 2.0      # 8th
         t = 0.0
         pattern = STYLE_SETTINGS.get(style, {}).get("drum_pattern", "kick-snare")
+
         while t < duration:
-            # kick
-            drum.notes.append(
-                pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1)
-            )
-            if pattern in ("kick-snare", "boom-bap", "slow-groove"):
-                # snare on 2
+            if pattern == "afro-groove":
+                # Kick on 1
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=110, pitch=38, start=t + beat, end=t + beat + 0.1
-                    )
+                    pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1)
                 )
-            if pattern == "four-on-floor":
-                # K on every beat
-                for off in [beat, beat * 2, beat * 3]:
-                    drum.notes.append(
-                        pretty_midi.Note(
-                            velocity=95,
-                            pitch=36,
-                            start=t + off,
-                            end=t + off + 0.08,
-                        )
-                    )
-            t += beat * 2
+                # light conga / percussion on the & of 1
+                drum.notes.append(
+                    pretty_midi.Note(velocity=70, pitch=60, start=t + half_beat, end=t + half_beat + 0.08)
+                )
+                # Snare on 2
+                drum.notes.append(
+                    pretty_midi.Note(velocity=105, pitch=38, start=t + beat, end=t + beat + 0.1)
+                )
+                # Percussion on the & of 2
+                drum.notes.append(
+                    pretty_midi.Note(velocity=65, pitch=60, start=t + beat + half_beat, end=t + beat + half_beat + 0.08)
+                )
+                # Kick again on 3 (lighter)
+                drum.notes.append(
+                    pretty_midi.Note(velocity=90, pitch=36, start=t + 2*beat, end=t + 2*beat + 0.08)
+                )
+                # Snare / clap on 4
+                drum.notes.append(
+                    pretty_midi.Note(velocity=110, pitch=39, start=t + 3*beat, end=t + 3*beat + 0.1)
+                )
+
+                # advance by a bar (4 beats)
+                t += 4 * beat
+
+            elif pattern == "one-drop":
+                # reggae-ish
+                drum.notes.append(
+                    pretty_midi.Note(velocity=95, pitch=36, start=t + beat, end=t + beat + 0.1)
+                )
+                drum.notes.append(
+                    pretty_midi.Note(velocity=105, pitch=38, start=t + beat, end=t + beat + 0.1)
+                )
+                t += 2 * beat
+
+            elif pattern == "four-on-floor":
+                # kick every beat
+                drum.notes.append(
+                    pretty_midi.Note(velocity=100, pitch=36, start=t, end=t + 0.1)
+                )
+                t += beat
+
+            else:
+                # fallback: simple kick-snare
+                drum.notes.append(
+                    pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1)
+                )
+                drum.notes.append(
+                    pretty_midi.Note(velocity=110, pitch=38, start=t + beat, end=t + beat + 0.1)
+                )
+                t += 2 * beat
+
         pm.instruments.append(drum)
 
     # --- Reggae guitar skank (offbeat stabs) ---
