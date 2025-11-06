@@ -302,8 +302,8 @@ def render_midi_band(
         pm.instruments.append(bass)
 
 # --- Drums ---
-    if use_drums:
-        drum = pretty_midi.Instrument(is_drum=True)
+if use_drums:
+    drum = pretty_midi.Instrument(program=0, is_drum=True)
         beat = 60.0 / bpm           # 1 beat (quarter note)
         half_beat = beat / 2.0      # 8th
         t = 0.0
