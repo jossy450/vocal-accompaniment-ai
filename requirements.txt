@@ -4,3 +4,7 @@ numpy
 scipy
 soundfile
 pydub
+pyfluidsynth
+pretty_midi
+mido
+requests
