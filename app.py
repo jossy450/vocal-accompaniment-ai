@@ -91,21 +91,42 @@ STYLE_SETTINGS = {
 # =========================================================
 # INIT: ensure soundfont once
 # =========================================================
-def ensure_soundfont() -> None:
-    os.makedirs(SOUNDFONT_DIR, exist_ok=True)
-    if not os.path.exists(SOUNDFONT_PATH):
-        print("SoundFont not found. Downloading FluidR3_GM.sf2 ...")
+# ---------- SOUNDFONT AUTO / SAFE ----------
+SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
+os.makedirs(SOUNDFONT_DIR, exist_ok=True)
+
+# allow override from env if you host it yourself
+SOUNDFONT_URL = os.environ.get(
+    "SOUNDFONT_URL",
+    "https://archive.org/download/fluidr3gm/FluidR3_GM.sf2",
+)
+SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
+
+
+def ensure_soundfont_safe() -> None:
+    """Try to download the SoundFont, but never crash the app if it fails."""
+    if os.path.exists(SOUNDFONT_PATH):
+        return
+    print("[soundfont] Not found locally, attempting download...")
+    try:
         with requests.get(SOUNDFONT_URL, stream=True, timeout=180) as r:
-            r.raise_for_status()
+            if r.status_code != 200:
+                print(f"[soundfont] Download failed, status={r.status_code}")
+                return
             with open(SOUNDFONT_PATH, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-        print("SoundFont downloaded to", SOUNDFONT_PATH)
+        print("[soundfont] Downloaded to", SOUNDFONT_PATH)
+    except Exception as e:
+        # don't kill the app on startup
+        print(f"[soundfont] ERROR downloading soundfont: {e}")
+        print("[soundfont] You can set SOUNDFONT_URL to your own hosted file.")
+        # just return — we'll check again at request time
 
 
-ensure_soundfont()
-
+# call once at startup, but non-fatal
+ensure_soundfont_safe()
 
 # =========================================================
 # DSP HELPERS
