@@ -3,62 +3,315 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vocal Accompaniment Demo</title>
+  <title>Vocal Accompaniment Studio</title>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; max-width: 760px; }
-    .row { margin: 1rem 0; }
-    .btn { padding: .7rem 1rem; border: 0; border-radius: .5rem; background: #111; color: #fff; cursor: pointer; }
-    .select { padding: .6rem; border-radius: .5rem; border: 1px solid #ccc }
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --accent: #f97316;
+      --accent-soft: rgba(249,115,22,0.12);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --radius: 1rem;
+    }
+    body {
+      background: radial-gradient(circle at top, #1f2937, #020617 65%);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 2.5rem 1rem 4rem;
+    }
+    .app {
+      width: min(100%, 820px);
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .title-block h1 {
+      font-size: 1.35rem;
+      margin: 0 0 .35rem;
+    }
+    .title-block p {
+      margin: 0;
+      font-size: .85rem;
+      color: var(--muted);
+    }
+    .badge {
+      background: rgba(249,115,22,0.1);
+      color: var(--accent);
+      border: 1px solid rgba(249,115,22,0.35);
+      padding: .25rem .65rem;
+      border-radius: 999px;
+      font-size: .7rem;
+      font-weight: 600;
+    }
+    .panel {
+      background: radial-gradient(circle at 20% 20%, rgba(249,115,22,0.055), rgba(2,6,23,0) 60%), var(--panel);
+      border: 1px solid rgba(148,163,184,0.12);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.25rem 1.5rem;
+      margin-bottom: 1rem;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+    }
+    .row {
+      margin: 1rem 0;
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    label {
+      font-size: .75rem;
+      font-weight: 500;
+      color: var(--muted);
+      display: block;
+      margin-bottom: .35rem;
+    }
+    input[type="file"] {
+      border: 1px dashed rgba(148,163,184,0.35);
+      padding: .8rem .9rem;
+      background: rgba(15,23,42,.35);
+      border-radius: .5rem;
+      width: 100%;
+      color: var(--text);
+    }
+    select, .btn, .checkbox-group {
+      font-size: .8rem;
+    }
+    select {
+      background: rgba(15,23,42,.35);
+      border: 1px solid rgba(148,163,184,0.35);
+      border-radius: .45rem;
+      padding: .55rem .7rem;
+      color: var(--text);
+      min-width: 180px;
+    }
+    .checkbox-row {
+      display: flex;
+      gap: .85rem;
+      flex-wrap: wrap;
+    }
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: .35rem;
+      background: rgba(15,23,42,.25);
+      border: 1px solid transparent;
+      border-radius: .55rem;
+      padding: .45rem .65rem;
+      cursor: pointer;
+      transition: .15s;
+    }
+    .checkbox input {
+      accent-color: var(--accent);
+    }
+    .checkbox:hover {
+      border: 1px solid rgba(249,115,22,.2);
+      background: rgba(249,115,22,.04);
+    }
+    .btn {
+      background: linear-gradient(90deg, #f97316, #fb923c);
+      border: none;
+      color: #0f172a;
+      font-weight: 600;
+      padding: .7rem 1.25rem;
+      border-radius: .6rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: .45rem;
+    }
+    .btn:disabled {
+      opacity: .55;
+      cursor: not-allowed;
+    }
+    .status {
+      min-height: 22px;
+      font-size: .75rem;
+      margin-top: .4rem;
+    }
+    .status.error {
+      color: #fda4af;
+    }
+    .status.success {
+      color: #bef264;
+    }
+    .audio-panel {
+      margin-top: 1.1rem;
+      background: rgba(15,23,42,.25);
+      border: 1px solid rgba(148,163,184,0.15);
+      padding: .75rem .75rem .25rem;
+      border-radius: .55rem;
+    }
+    audio {
+      width: 100%;
+      margin-top: .5rem;
+    }
+    .download-link {
+      margin-top: .6rem;
+      display: inline-block;
+      font-size: .75rem;
+      color: var(--accent);
+    }
+    .mini {
+      font-size: .7rem;
+      color: var(--muted);
+    }
+    @media (max-width: 620px) {
+      .header { flex-direction: column; align-items: flex-start; }
+      select { width: 100%; }
+      .btn { width: 100%; justify-content: center; }
+    }
   </style>
 </head>
 <body>
-  <h1>Vocal → Accompaniment</h1>
-  <p>Select a WAV vocal, pick a style, and generate a backing track.</p>
+  <main class="app">
+    <div class="header">
+      <div class="title-block">
+        <h1>Vocal Accompaniment Studio</h1>
+        <p>Upload a vocal → pick West African style → auto-band backing.</p>
+      </div>
+      <span class="badge">beta · MIDI/SF2</span>
+    </div>
 
-  <div class="row">
-    <input type="file" id="file" accept="audio/wav" />
-  </div>
+    <section class="panel">
+      <div class="row">
+        <div style="flex: 1 1 240px;">
+          <label for="file">Vocal file (WAV / MP3 / M4A)</label>
+          <input type="file" id="file" accept="audio/*" />
+          <p class="mini">For best results, use a clean mono vocal.</p>
+        </div>
+        <div style="flex: 1 1 180px;">
+          <label for="style">Style</label>
+          <select id="style">
+            <option value="afrobeat">Afrobeat</option>
+            <option value="hi_life">Hi Life</option>
+            <option value="nigerian_gospel">Nigerian Gospel</option>
+            <option value="reggae">Reggae</option>
+            <option value="rnb">R&amp;B</option>
+            <option value="hip_hop">Hip Hop</option>
+          </select>
+        </div>
+      </div>
 
-  <div class="row">
-    <label for="style">Style:</label>
-    <select id="style" class="select">
-      <option value="afrobeat">Afrobeat</option>
-      <option value="hi_life">Hi Life</option>
-      <option value="hip_hop">Hip Hop</option>
-      <option value="calypso">Calypso</option>
-      <option value="reggae">Reggae</option>
-      <option value="rnb">R&amp;B</option>
-      <option value="classical">Classical</option>
-      <option value="davido_mix">Davido Mix</option>
-      <option value="nigerian_gospel">Nigerian Gospel</option>
-    </select>
-  </div>
+      <div class="row">
+        <label>Instruments</label>
+        <div class="checkbox-row">
+          <label class="checkbox">
+            <input type="checkbox" id="piano" checked />
+            <span>Piano / Keys</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="bass" checked />
+            <span>Bass</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="drums" checked />
+            <span>Drums / Perc</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="guitar" />
+            <span>Guitar / Skank</span>
+          </label>
+        </div>
+      </div>
 
-  <div class="row"><button class="btn" id="go">Generate</button></div>
-  <div id="msg"></div>
-  <div class="row"><audio id="player" controls></audio></div>
+      <div class="row" style="align-items: center; gap: .75rem;">
+        <button class="btn" id="go">
+          <span id="btn-text">Generate accompaniment</span>
+          <span id="spinner" style="display:none;">⏳</span>
+        </button>
+        <span class="status" id="msg"></span>
+      </div>
+
+      <div class="audio-panel" id="audio-panel" style="display:none;">
+        <label>Preview</label>
+        <audio id="player" controls></audio>
+        <a id="download" class="download-link" href="#" download="accompaniment.wav" style="display:none;">Download WAV</a>
+      </div>
+    </section>
+  </main>
 
   <script>
-    const go = document.getElementById('go');
-    go.onclick = async () => {
-      const f = document.getElementById('file').files[0];
+    const goBtn = document.getElementById('go');
+    const msg = document.getElementById('msg');
+    const player = document.getElementById('player');
+    const panel = document.getElementById('audio-panel');
+    const downloadLink = document.getElementById('download');
+    const spinner = document.getElementById('spinner');
+    const btnText = document.getElementById('btn-text');
+
+    async function generate() {
+      const fileInput = document.getElementById('file');
       const style = document.getElementById('style').value;
-      const msg = document.getElementById('msg');
-      msg.textContent = 'Generating...';
-      if (!f) { msg.textContent = 'Pick a WAV file first.'; return; }
-      const buf = await f.arrayBuffer();
-      const res = await fetch(`/generate?style=${style}`, {
-        method: 'POST',
-        headers: {'Content-Type':'application/octet-stream'},
-        body: buf
-      });
-      if (!res.ok) { msg.textContent = 'Error: ' + (await res.text()); return; }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const player = document.getElementById('player');
-      player.src = url;
-      msg.textContent = 'Done!';
+      const piano = document.getElementById('piano').checked ? 1 : 0;
+      const bass = document.getElementById('bass').checked ? 1 : 0;
+      const drums = document.getElementById('drums').checked ? 1 : 0;
+      const guitar = document.getElementById('guitar').checked ? 1 : 0;
+
+      const file = fileInput.files[0];
+
+      msg.className = 'status';
+      msg.textContent = '';
+
+      if (!file) {
+        msg.textContent = 'Please select an audio file.';
+        msg.classList.add('error');
+        return;
+      }
+
+      if (!file.type.startsWith('audio/')) {
+        msg.textContent = 'File is not an audio file.';
+        msg.classList.add('error');
+        return;
+      }
+
+      goBtn.disabled = true;
+      spinner.style.display = 'inline-block';
+      btnText.textContent = 'Processing...';
+      msg.textContent = 'Uploading & generating accompaniment...';
+
+      try {
+        const buf = await file.arrayBuffer();
+        const query = `style=${encodeURIComponent(style)}&piano=${piano}&bass=${bass}&drums=${drums}&guitar=${guitar}`;
+        const res = await fetch(`/generate?${query}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/octet-stream'},
+          body: buf
+        });
+
+        if (!res.ok) {
+          const err = await res.text();
+          msg.textContent = 'Error: ' + err;
+          msg.classList.add('error');
+        } else {
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          player.src = url;
+          panel.style.display = 'block';
+          downloadLink.href = url;
+          downloadLink.style.display = 'inline-block';
+          msg.textContent = 'Done! Preview below.';
+          msg.classList.add('success');
+        }
+      } catch (e) {
+        console.error(e);
+        msg.textContent = 'Network or server error.';
+        msg.classList.add('error');
+      } finally {
+        goBtn.disabled = false;
+        spinner.style.display = 'none';
+        btnText.textContent = 'Generate accompaniment';
+      }
     }
+
+    goBtn.addEventListener('click', generate);
   </script>
 </body>
 </html>
