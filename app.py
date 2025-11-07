@@ -102,7 +102,6 @@ SOUNDFONT_URL = os.environ.get(
 )
 SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
 
-
 def ensure_soundfont_safe() -> None:
     """Try to download the SoundFont, but never crash the app if it fails."""
     if os.path.exists(SOUNDFONT_PATH):
@@ -136,7 +135,6 @@ def detect_voice(audio: np.ndarray, sr: int) -> bool:
         return False
     energy = np.sqrt(np.mean(audio ** 2))
     return energy > 0.01
-
 
 A4 = 440.0
 
@@ -172,7 +170,6 @@ def estimate_tempo(audio: np.ndarray, sr: int) -> float:
     bpm = 60.0 * sr / (lag * hop)
     return float(np.clip(bpm, 60.0, 180.0))
 
-
 # =========================================================
 # AUDIO LOADER (wav → float OR fallback to pydub)
 # =========================================================
@@ -198,13 +195,11 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
     audio = np.array(seg.get_array_of_samples()).astype(np.float32) / 32768.0
     return audio, sr
 
-
 # =========================================================
 # MIDI / HARMONY HELPERS
 # =========================================================
 def midi_note_from_freq(freq: float) -> int:
     return int(69 + 12 * np.log2(freq / 440.0))
-
 
 def degree_to_midi(root_midi: int, deg: str) -> int:
     """Map roman-ish degree to MIDI pitch in a simple major-ish scale."""
@@ -224,7 +219,6 @@ def degree_to_midi(root_midi: int, deg: str) -> int:
         return root_midi + 11
     return root_midi
 
-
 def pick_progression(style: str) -> list[str]:
     style_def = STYLE_SETTINGS.get(style)
     if not style_def:
@@ -234,7 +228,6 @@ def pick_progression(style: str) -> list[str]:
         return ["i", "v", "vi", "iv"]
     return random.choice(progressions)
 
-
 def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
     degrees = pick_progression(style)
     prog = []
@@ -242,7 +235,6 @@ def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
         deg = degrees[i % len(degrees)]
         prog.append(degree_to_midi(root_midi, deg))
     return prog
-
 
 # =========================================================
 # INSTRUMENT RENDERING
@@ -301,9 +293,9 @@ def render_midi_band(
                 break
         pm.instruments.append(bass)
 
-# --- Drums ---
-if use_drums:
-    drum = pretty_midi.Instrument(program=0, is_drum=True)
+    # --- Drums ---
+    if use_drums:
+        drum = pretty_midi.Instrument(program=0, is_drum=True)
         beat = 60.0 / bpm           # 1 beat (quarter note)
         half_beat = beat / 2.0      # 8th
         t = 0.0
@@ -400,7 +392,6 @@ if use_drums:
 
     return accomp
 
-
 # =========================================================
 # ROUTES
 # =========================================================
@@ -410,7 +401,6 @@ async def root_ui():
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"detail": "UI not found, but API is running."}
-
 
 @app.post("/generate")
 async def generate(
