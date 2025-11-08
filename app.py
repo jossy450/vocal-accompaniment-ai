@@ -471,6 +471,27 @@ def render_midi_band(
     accomp, _ = sf.read(tmp_path)
     return accomp
 
+def rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(x**2)) + 1e-9)
+
+
+def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.ndarray:
+    """
+    Very cheap one-pole HPF to remove rumble from accompaniment.
+    Not studio-grade, but enough to stop mud.
+    """
+    # y[n] = x[n] - x[n-1] + R * y[n-1]
+    # R ~= exp(-2π f / sr)
+    rc = np.exp(-2 * np.pi * cutoff / sr)
+    y = np.zeros_like(accomp)
+    prev_x = 0.0
+    prev_y = 0.0
+    for i, x in enumerate(accomp):
+        y[i] = x - prev_x + rc * prev_y
+        prev_x = x
+        prev_y = y[i]
+    return y
+
 
 # =========================================================
 # ROUTES
@@ -523,14 +544,39 @@ async def generate(
         use_guitar=guitar,
     )
 
-    # make sure lengths match
-    min_len = min(len(audio), len(accomp))
-    audio = audio[:min_len]
-    accomp = accomp[:min_len]
+   # make sure lengths match
+min_len = min(len(audio), len(accomp))
+vocal = audio[:min_len]
+band = accomp[:min_len]
 
-    # mix under vocal
-    mix = 0.9 * audio + 0.9 * accomp
-    mix = np.clip(mix, -1.0, 1.0)
+# 1) high-pass the band a bit to reduce mud
+band = simple_highpass(band, sr, cutoff=140.0)
+
+# 2) loudness match (bring band down to vocal level)
+v_rms = rms(vocal)
+b_rms = rms(band)
+if b_rms > 0:
+    band = band * (v_rms / (b_rms * 1.5))  # 1.5 = keep band a bit lower
+
+# 3) simple sidechain duck: create envelope from vocal
+env = np.abs(vocal)
+# smooth envelope
+win = 256
+kernel = np.ones(win) / win
+env_smooth = np.convolve(env, kernel, mode="same")
+# build gain for band: when vocal loud → reduce band
+duck_amount = 0.45  # how much to duck (0..1)
+band_gain = 1.0 - duck_amount * np.clip(env_smooth * 4.0, 0.0, 1.0)
+band = band * band_gain
+
+# 4) combine with headroom
+mix = vocal * 0.98 + band * 0.9
+
+# 5) final safety limiter
+peak = np.max(np.abs(mix)) + 1e-9
+if peak > 1.0:
+    mix = mix / peak
+
 
     # stream back as WAV
     out_buf = io.BytesIO()
