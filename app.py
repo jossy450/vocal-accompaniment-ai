@@ -1,3 +1,34 @@
+BASE_DIR = os.path.dirname(__file__)
+SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
+os.makedirs(SOUNDFONT_DIR, exist_ok=True)
+
+SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
+SOUNDFONT_URL = os.environ.get(
+    "SOUNDFONT_URL",
+    "https://archive.org/download/fluidr3gm/FluidR3_GM.sf2",
+)
+
+def ensure_soundfont_safe() -> None:
+    """Try to ensure the .sf2 is present, but don't crash the app if it can't be downloaded."""
+    if os.path.exists(SOUNDFONT_PATH):
+        return
+    print("[soundfont] Not found, attempting download from:", SOUNDFONT_URL)
+    try:
+        with requests.get(SOUNDFONT_URL, stream=True, timeout=180) as r:
+            if r.status_code != 200:
+                print("[soundfont] download failed with status", r.status_code)
+                return
+            with open(SOUNDFONT_PATH, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        print("[soundfont] download complete")
+    except Exception as e:
+        print("[soundfont] ERROR downloading:", e)
+
+# try once at startup
+ensure_soundfont_safe()
+
 import os
 import io
 import tempfile
