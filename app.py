@@ -471,17 +471,10 @@ def render_midi_band(
     accomp, _ = sf.read(tmp_path)
     return accomp
 
-def rms(x: np.ndarray) -> float:
+    def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x**2)) + 1e-9)
 
-
 def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.ndarray:
-    """
-    Very cheap one-pole HPF to remove rumble from accompaniment.
-    Not studio-grade, but enough to stop mud.
-    """
-    # y[n] = x[n] - x[n-1] + R * y[n-1]
-    # R ~= exp(-2π f / sr)
     rc = np.exp(-2 * np.pi * cutoff / sr)
     y = np.zeros_like(accomp)
     prev_x = 0.0
@@ -517,21 +510,18 @@ async def generate(
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # load user vocal
-    audio, sr = load_audio_from_bytes(raw)
+    # 1) load user audio (vocal)
+    vocal, sr = load_audio_from_bytes(raw)
 
-    if not detect_voice(audio, sr):
-        print("[warn] low vocal energy — still proceeding")
-
-    # analysis
-    f0 = estimate_key_freq(audio, sr)
-    bpm = estimate_tempo(audio, sr)
+    # 2) analyse vocal
+    f0 = estimate_key_freq(vocal, sr)
+    bpm = estimate_tempo(vocal, sr)
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
 
-    duration = len(audio) / sr
+    duration = len(vocal) / sr
 
-    # render accompaniment, quantized
+    # 3) render band (MIDI → audio)
     accomp = render_midi_band(
         sr,
         duration,
@@ -544,41 +534,40 @@ async def generate(
         use_guitar=guitar,
     )
 
-   # make sure lengths match
-min_len = min(len(audio), len(accomp))
-vocal = audio[:min_len]
-band = accomp[:min_len]
+    # 4) make sure same length
+    min_len = min(len(vocal), len(accomp))
+    vocal = vocal[:min_len]
+    band = accomp[:min_len]
 
-# 1) high-pass the band a bit to reduce mud
-band = simple_highpass(band, sr, cutoff=140.0)
+    # ====== MIX IMPROVEMENT ======
+    # helpers must exist above: rms(), simple_highpass()
+    # high-pass band to avoid mud
+    band = simple_highpass(band, sr, cutoff=140.0)
 
-# 2) loudness match (bring band down to vocal level)
-v_rms = rms(vocal)
-b_rms = rms(band)
-if b_rms > 0:
-    band = band * (v_rms / (b_rms * 1.5))  # 1.5 = keep band a bit lower
+    # loudness match
+    v_r = rms(vocal)
+    b_r = rms(band)
+    if b_r > 0:
+        band = band * (v_r / (b_r * 1.5))
 
-# 3) simple sidechain duck: create envelope from vocal
-env = np.abs(vocal)
-# smooth envelope
-win = 256
-kernel = np.ones(win) / win
-env_smooth = np.convolve(env, kernel, mode="same")
-# build gain for band: when vocal loud → reduce band
-duck_amount = 0.45  # how much to duck (0..1)
-band_gain = 1.0 - duck_amount * np.clip(env_smooth * 4.0, 0.0, 1.0)
-band = band * band_gain
+    # simple sidechain ducking
+    env = np.abs(vocal)
+    win = 256
+    kernel = np.ones(win) / win
+    env_smooth = np.convolve(env, kernel, mode="same")
+    duck_amount = 0.45
+    band_gain = 1.0 - duck_amount * np.clip(env_smooth * 4.0, 0.0, 1.0)
+    band = band * band_gain
 
-# 4) combine with headroom
-mix = vocal * 0.98 + band * 0.9
+    # combine with headroom
+    mix = vocal * 0.98 + band * 0.9
 
-# 5) final safety limiter
-peak = np.max(np.abs(mix)) + 1e-9
-if peak > 1.0:
-    mix = mix / peak
+    # final safety limiter
+    peak = np.max(np.abs(mix)) + 1e-9
+    if peak > 1.0:
+        mix = mix / peak
 
-
-    # stream back as WAV
+    # 5) return WAV
     out_buf = io.BytesIO()
     wavfile.write(out_buf, sr, (mix * 32767).astype(np.int16))
     out_buf.seek(0)
