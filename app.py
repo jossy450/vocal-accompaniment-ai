@@ -381,16 +381,27 @@ def render_midi_band(
             tbar += bar_seconds
         pm.instruments.append(guitar)
 
-    # --- Render to WAV via fluidsynth ---
+       # --- Render to WAV via fluidsynth (version-safe) ---
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpwav:
+        tmp_path = tmpwav.name
+
+    try:
+        # Newer pretty_midi: returns np.array
+        audio_data = pm.fluidsynth(fs=sr, sf2_path=SOUNDFONT_PATH)
+        # write it ourselves
+        sf.write(tmp_path, audio_data, sr)
+    except TypeError:
+        # Older pretty_midi that accepted filename=
         pm.fluidsynth(
             fs=sr,
             sf2_path=SOUNDFONT_PATH,
-            filename=tmpwav.name,
+            filename=tmp_path,
         )
-        accomp, _ = sf.read(tmpwav.name)
 
+    # now load the rendered accompaniment
+    accomp, _ = sf.read(tmp_path)
     return accomp
+
 
 # =========================================================
 # ROUTES
