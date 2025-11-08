@@ -26,10 +26,9 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
 os.makedirs(SOUNDFONT_DIR, exist_ok=True)
-
 SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
 
-# your GitHub release URL (can be overridden in Railway)
+# your GitHub release URL (overridable in Railway)
 SOUNDFONT_URL = os.environ.get(
     "SOUNDFONT_URL",
     "https://github.com/jossy450/vocal-accompaniment-ai/releases/download/soundfont-v1/FluidR3_GM.sf2",
@@ -38,7 +37,7 @@ SOUNDFONT_URL = os.environ.get(
 # let pydub find ffmpeg
 AudioSegment.converter = which("ffmpeg") or "/usr/bin/ffmpeg"
 
-app = FastAPI(title="Vocal Accompaniment Generator", version="0.4")
+app = FastAPI(title="Vocal Accompaniment Generator", version="0.5")
 
 if os.path.isdir(STATIC_DIR):
     app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
@@ -48,7 +47,7 @@ if os.path.isdir(STATIC_DIR):
 # SOUNDFONT HANDLING
 # =========================================================
 def ensure_soundfont_safe() -> None:
-    """Download SF2 if missing, but don't crash if download fails."""
+    """Download SF2 if missing, but don't crash if it fails."""
     if os.path.exists(SOUNDFONT_PATH):
         return
     print("[soundfont] Not found, downloading from:", SOUNDFONT_URL)
@@ -66,21 +65,20 @@ def ensure_soundfont_safe() -> None:
         print("[soundfont] ERROR:", e)
 
 
-# call once at startup
+# do it once on startup
 ensure_soundfont_safe()
 
 
 # =========================================================
 # STYLE DEFINITIONS
 # =========================================================
-
 AFRO_PROGRESSIONS = [
-    ["i", "v", "vi", "iv"],   # 1–5–6–4
-    ["i", "iv", "v", "iv"],   # 1–4–5–4
-    ["ii", "v", "i", "i"],    # 2–5–1
-    ["i", "vi", "ii", "v"],   # 1–6–2–5
-    ["i", "v", "iv", "v"],    # 1–5–4–5
-    ["i", "iv", "vi", "v"],   # 1–4–6–5
+    ["i", "v", "vi", "iv"],
+    ["i", "iv", "v", "iv"],
+    ["ii", "v", "i", "i"],
+    ["i", "vi", "ii", "v"],
+    ["i", "v", "iv", "v"],
+    ["i", "iv", "vi", "v"],
 ]
 
 STYLE_SETTINGS = {
@@ -124,7 +122,7 @@ STYLE_SETTINGS = {
 
 
 # =========================================================
-# DSP / ANALYSIS HELPERS
+# ANALYSIS / DSP HELPERS
 # =========================================================
 def detect_voice(audio: np.ndarray, sr: int) -> bool:
     if audio.size == 0:
@@ -169,7 +167,6 @@ def estimate_tempo(audio: np.ndarray, sr: int) -> float:
 # AUDIO LOADER
 # =========================================================
 def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
-    # try WAV fast path
     try:
         sr, audio = wavfile.read(io.BytesIO(raw))
         if audio.ndim > 1:
@@ -183,7 +180,6 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
     except Exception:
         pass
 
-    # fallback
     seg = AudioSegment.from_file(io.BytesIO(raw))
     seg = seg.set_channels(1)
     sr = seg.frame_rate
@@ -192,28 +188,23 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
 
 
 # =========================================================
-# MIDI / HARMONY HELPERS
+# MIDI / HARMONY
 # =========================================================
 def midi_note_from_freq(freq: float) -> int:
     return int(69 + 12 * np.log2(freq / 440.0))
 
 
 def degree_to_midi(root_midi: int, deg: str) -> int:
-    if deg == "i":
-        return root_midi
-    if deg == "ii":
-        return root_midi + 2
-    if deg == "iii":
-        return root_midi + 4
-    if deg == "iv":
-        return root_midi + 5
-    if deg == "v":
-        return root_midi + 7
-    if deg == "vi":
-        return root_midi + 9
-    if deg == "vii":
-        return root_midi + 11
-    return root_midi
+    mapping = {
+        "i": 0,
+        "ii": 2,
+        "iii": 4,
+        "iv": 5,
+        "v": 7,
+        "vi": 9,
+        "vii": 11,
+    }
+    return root_midi + mapping.get(deg, 0)
 
 
 def pick_progression(style: str) -> list[str]:
@@ -228,23 +219,39 @@ def pick_progression(style: str) -> list[str]:
 
 def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
     degrees = pick_progression(style)
-    prog = []
+    out = []
     for i in range(bars):
         deg = degrees[i % len(degrees)]
-        prog.append(degree_to_midi(root_midi, deg))
-    return prog
+        out.append(degree_to_midi(root_midi, deg))
+    return out
 
 
 # =========================================================
-# QUANTIZATION
+# QUANTIZATION + SIMPLE MIX HELPERS
 # =========================================================
 def quantize_time(t: float, grid: float) -> float:
-    """Snap a time value to the nearest grid (in seconds)."""
     return round(t / grid) * grid
 
 
+def rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(x ** 2)) + 1e-9)
+
+
+def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.ndarray:
+    """very cheap HPF to reduce mud from band."""
+    rc = np.exp(-2 * np.pi * cutoff / sr)
+    y = np.zeros_like(accomp)
+    prev_x = 0.0
+    prev_y = 0.0
+    for i, x in enumerate(accomp):
+        y[i] = x - prev_x + rc * prev_y
+        prev_x = x
+        prev_y = y[i]
+    return y
+
+
 # =========================================================
-# INSTRUMENT RENDERING
+# RENDER MIDI BAND
 # =========================================================
 def render_midi_band(
     sr: int,
@@ -257,13 +264,12 @@ def render_midi_band(
     use_drums: bool = True,
     use_guitar: bool = False,
 ) -> np.ndarray:
-    # make sure SF2 exists
     if not os.path.exists(SOUNDFONT_PATH):
         ensure_soundfont_safe()
     if not os.path.exists(SOUNDFONT_PATH):
         raise ValueError(
             f"SoundFont not found at {SOUNDFONT_PATH}. "
-            "Upload it or set SOUNDFONT_URL to a reachable location."
+            "Upload it or set SOUNDFONT_URL."
         )
 
     root_midi = midi_note_from_freq(root_freq)
@@ -271,12 +277,11 @@ def render_midi_band(
     bars = int(np.ceil(duration / bar_seconds)) + 1
     progression = build_chord_progression(root_midi, style, bars)
 
-    # timing grid
     sixteenth = bar_seconds / 16.0
 
     pm = pretty_midi.PrettyMIDI()
 
-    # --- Piano ---
+    # piano
     if use_piano:
         piano = pretty_midi.Instrument(program=0)
         t = 0.0
@@ -297,7 +302,7 @@ def render_midi_band(
                 break
         pm.instruments.append(piano)
 
-    # --- Bass ---
+    # bass
     if use_bass:
         bass = pretty_midi.Instrument(program=32)
         t = 0.0
@@ -317,17 +322,15 @@ def render_midi_band(
                 break
         pm.instruments.append(bass)
 
-    # --- Drums ---
+    # drums
     if use_drums:
         drum = pretty_midi.Instrument(program=0, is_drum=True)
         beat = 60.0 / bpm
-        half_beat = beat / 2.0
+        half = beat / 2.0
         t = 0.0
         pattern = STYLE_SETTINGS.get(style, {}).get("drum_pattern", "kick-snare")
-
         while t < duration:
             if pattern == "afro-groove":
-                # kick on 1
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=110,
@@ -336,16 +339,14 @@ def render_midi_band(
                         end=quantize_time(t + 0.1, sixteenth),
                     )
                 )
-                # perc on & of 1
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=70,
                         pitch=60,
-                        start=quantize_time(t + half_beat, sixteenth),
-                        end=quantize_time(t + half_beat + 0.08, sixteenth),
+                        start=quantize_time(t + half, sixteenth),
+                        end=quantize_time(t + half + 0.08, sixteenth),
                     )
                 )
-                # snare on 2
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=105,
@@ -354,16 +355,14 @@ def render_midi_band(
                         end=quantize_time(t + beat + 0.1, sixteenth),
                     )
                 )
-                # perc on & of 2
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=65,
                         pitch=60,
-                        start=quantize_time(t + beat + half_beat, sixteenth),
-                        end=quantize_time(t + beat + half_beat + 0.08, sixteenth),
+                        start=quantize_time(t + beat + half, sixteenth),
+                        end=quantize_time(t + beat + half + 0.08, sixteenth),
                     )
                 )
-                # light kick on 3
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=90,
@@ -372,7 +371,6 @@ def render_midi_band(
                         end=quantize_time(t + 2 * beat + 0.08, sixteenth),
                     )
                 )
-                # clap on 4
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=110,
@@ -413,7 +411,7 @@ def render_midi_band(
                 )
                 t += beat
 
-            else:
+            else:  # fallback
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=110,
@@ -434,7 +432,7 @@ def render_midi_band(
 
         pm.instruments.append(drum)
 
-    # --- Guitar skank ---
+    # guitar skank
     wants_skank = STYLE_SETTINGS.get(style, {}).get("guitar_skank", False)
     if use_guitar or wants_skank:
         guitar = pretty_midi.Instrument(program=25)
@@ -443,47 +441,31 @@ def render_midi_band(
             for beat_i in range(4):
                 beat_start = tbar + (beat_i * (bar_seconds / 4.0))
                 offbeat = beat_start + (bar_seconds / 8.0)
-                q_offbeat = quantize_time(offbeat, sixteenth)
-                if q_offbeat < duration:
+                q_off = quantize_time(offbeat, sixteenth)
+                if q_off < duration:
                     guitar.notes.append(
                         pretty_midi.Note(
                             velocity=80,
                             pitch=root_midi + 7,
-                            start=q_offbeat,
-                            end=q_offbeat + 0.12,
+                            start=q_off,
+                            end=q_off + 0.12,
                         )
                     )
             tbar += bar_seconds
         pm.instruments.append(guitar)
 
-    # --- Render to audio via FluidSynth (version-safe) ---
+    # render via fluidsynth
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpwav:
         tmp_path = tmpwav.name
 
     try:
-        # newer pretty_midi → returns numpy array
         audio_data = pm.fluidsynth(fs=sr, sf2_path=SOUNDFONT_PATH)
         sf.write(tmp_path, audio_data, sr)
     except TypeError:
-        # older pretty_midi → accepts filename=
         pm.fluidsynth(fs=sr, sf2_path=SOUNDFONT_PATH, filename=tmp_path)
 
     accomp, _ = sf.read(tmp_path)
     return accomp
-
-    def rms(x: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(x**2)) + 1e-9)
-
-def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.ndarray:
-    rc = np.exp(-2 * np.pi * cutoff / sr)
-    y = np.zeros_like(accomp)
-    prev_x = 0.0
-    prev_y = 0.0
-    for i, x in enumerate(accomp):
-        y[i] = x - prev_x + rc * prev_y
-        prev_x = x
-        prev_y = y[i]
-    return y
 
 
 # =========================================================
@@ -510,19 +492,18 @@ async def generate(
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # 1) load user audio (vocal)
+    # 1. load vocal
     vocal, sr = load_audio_from_bytes(raw)
 
-    # 2) analyse vocal
+    # 2. analyse
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
-
     duration = len(vocal) / sr
 
-    # 3) render band (MIDI → audio)
-    accomp = render_midi_band(
+    # 3. render band
+    band = render_midi_band(
         sr,
         duration,
         bpm,
@@ -534,23 +515,19 @@ async def generate(
         use_guitar=guitar,
     )
 
-    # 4) make sure same length
-    min_len = min(len(vocal), len(accomp))
+    # 4. align lengths
+    min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
-    band = accomp[:min_len]
+    band = band[:min_len]
 
-    # ====== MIX IMPROVEMENT ======
-    # helpers must exist above: rms(), simple_highpass()
-    # high-pass band to avoid mud
+    # 5. mix (HPF + loudness match + ducking)
     band = simple_highpass(band, sr, cutoff=140.0)
 
-    # loudness match
     v_r = rms(vocal)
     b_r = rms(band)
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
-    # simple sidechain ducking
     env = np.abs(vocal)
     win = 256
     kernel = np.ones(win) / win
@@ -559,15 +536,13 @@ async def generate(
     band_gain = 1.0 - duck_amount * np.clip(env_smooth * 4.0, 0.0, 1.0)
     band = band * band_gain
 
-    # combine with headroom
     mix = vocal * 0.98 + band * 0.9
 
-    # final safety limiter
     peak = np.max(np.abs(mix)) + 1e-9
     if peak > 1.0:
         mix = mix / peak
 
-    # 5) return WAV
+    # 6. return WAV
     out_buf = io.BytesIO()
     wavfile.write(out_buf, sr, (mix * 32767).astype(np.int16))
     out_buf.seek(0)
@@ -575,5 +550,5 @@ async def generate(
     return StreamingResponse(
         out_buf,
         media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+        headers={"Content-Disposition": 'attachment; filename=\"accompaniment.wav\"'},
     )
