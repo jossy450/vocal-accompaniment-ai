@@ -5,9 +5,8 @@ os.makedirs(SOUNDFONT_DIR, exist_ok=True)
 SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
 SOUNDFONT_URL = os.environ.get(
     "SOUNDFONT_URL",
-    "https://archive.org/download/fluidr3gm/FluidR3_GM.sf2",
+    "https://github.com/jossy450/vocal-accompaniment-ai/releases/download/soundfont-v1/FluidR3_GM.sf2",
 )
-
 def ensure_soundfont_safe() -> None:
     """Try to ensure the .sf2 is present, but don't crash the app if it can't be downloaded."""
     if os.path.exists(SOUNDFONT_PATH):
