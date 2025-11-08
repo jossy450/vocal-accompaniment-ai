@@ -1,33 +1,3 @@
-BASE_DIR = os.path.dirname(__file__)
-SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
-os.makedirs(SOUNDFONT_DIR, exist_ok=True)
-
-SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
-SOUNDFONT_URL = os.environ.get(
-    "SOUNDFONT_URL",
-    "https://github.com/jossy450/vocal-accompaniment-ai/releases/download/soundfont-v1/FluidR3_GM.sf2",
-)
-def ensure_soundfont_safe() -> None:
-    """Try to ensure the .sf2 is present, but don't crash the app if it can't be downloaded."""
-    if os.path.exists(SOUNDFONT_PATH):
-        return
-    print("[soundfont] Not found, attempting download from:", SOUNDFONT_URL)
-    try:
-        with requests.get(SOUNDFONT_URL, stream=True, timeout=180) as r:
-            if r.status_code != 200:
-                print("[soundfont] download failed with status", r.status_code)
-                return
-            with open(SOUNDFONT_PATH, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        print("[soundfont] download complete")
-    except Exception as e:
-        print("[soundfont] ERROR downloading:", e)
-
-# try once at startup
-ensure_soundfont_safe()
-
 import os
 import io
 import tempfile
@@ -47,21 +17,66 @@ from pydub import AudioSegment
 from pydub.utils import which
 
 # =========================================================
-# APP + PATHS
+# PATHS & GLOBALS
 # =========================================================
-app = FastAPI(title="Vocal Accompaniment Generator", version="0.3")
-
 BASE_DIR = os.path.dirname(__file__)
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-if os.path.isdir(STATIC_DIR):
-    app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
+# static (frontend)
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+# soundfont
 SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
+os.makedirs(SOUNDFONT_DIR, exist_ok=True)
+
 SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
-SOUNDFONT_URL = "https://archive.org/download/fluidr3gm/FluidR3_GM.sf2"
+
+# ✅ your hosted GitHub Release link (can be overridden in Railway)
+SOUNDFONT_URL = os.environ.get(
+    "SOUNDFONT_URL",
+    "https://github.com/jossy450/vocal-accompaniment-ai/releases/download/soundfont-v1/FluidR3_GM.sf2",
+)
 
 # Make pydub find ffmpeg (installed in Dockerfile)
 AudioSegment.converter = which("ffmpeg") or "/usr/bin/ffmpeg"
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
+app = FastAPI(title="Vocal Accompaniment Generator", version="0.3")
+
+if os.path.isdir(STATIC_DIR):
+    app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+
+
+# =========================================================
+# SOUNDFONT HANDLING
+# =========================================================
+def ensure_soundfont_safe() -> None:
+    """
+    Try to ensure the .sf2 is present, but don't crash the app if download fails.
+    We call this at startup AND before rendering.
+    """
+    if os.path.exists(SOUNDFONT_PATH):
+        return
+
+    print("[soundfont] Not found, attempting download from:", SOUNDFONT_URL)
+    try:
+        with requests.get(SOUNDFONT_URL, stream=True, timeout=180) as r:
+            if r.status_code != 200:
+                print("[soundfont] download failed with status", r.status_code)
+                return
+            with open(SOUNDFONT_PATH, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        print("[soundfont] download complete →", SOUNDFONT_PATH)
+    except Exception as e:
+        print("[soundfont] ERROR downloading:", e)
+        print("[soundfont] You can set SOUNDFONT_URL to your own hosted file.")
+
+
+# try once on startup
+ensure_soundfont_safe()
 
 
 # =========================================================
@@ -119,45 +134,6 @@ STYLE_SETTINGS = {
 
 
 # =========================================================
-# INIT: ensure soundfont once
-# =========================================================
-# ---------- SOUNDFONT AUTO / SAFE ----------
-SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
-os.makedirs(SOUNDFONT_DIR, exist_ok=True)
-
-# allow override from env if you host it yourself
-SOUNDFONT_URL = os.environ.get(
-    "SOUNDFONT_URL",
-    "https://archive.org/download/fluidr3gm/FluidR3_GM.sf2",
-)
-SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
-
-def ensure_soundfont_safe() -> None:
-    """Try to download the SoundFont, but never crash the app if it fails."""
-    if os.path.exists(SOUNDFONT_PATH):
-        return
-    print("[soundfont] Not found locally, attempting download...")
-    try:
-        with requests.get(SOUNDFONT_URL, stream=True, timeout=180) as r:
-            if r.status_code != 200:
-                print(f"[soundfont] Download failed, status={r.status_code}")
-                return
-            with open(SOUNDFONT_PATH, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        print("[soundfont] Downloaded to", SOUNDFONT_PATH)
-    except Exception as e:
-        # don't kill the app on startup
-        print(f"[soundfont] ERROR downloading soundfont: {e}")
-        print("[soundfont] You can set SOUNDFONT_URL to your own hosted file.")
-        # just return — we'll check again at request time
-
-
-# call once at startup, but non-fatal
-ensure_soundfont_safe()
-
-# =========================================================
 # DSP HELPERS
 # =========================================================
 def detect_voice(audio: np.ndarray, sr: int) -> bool:
@@ -165,6 +141,7 @@ def detect_voice(audio: np.ndarray, sr: int) -> bool:
         return False
     energy = np.sqrt(np.mean(audio ** 2))
     return energy > 0.01
+
 
 A4 = 440.0
 
@@ -175,9 +152,9 @@ def estimate_key_freq(audio: np.ndarray, sr: int) -> float:
         return A4
     segment = audio[:sr] if audio.size >= sr else audio
     segment = segment - np.mean(segment)
-    corr = np.correlate(segment, segment, mode="full")[len(segment) - 1 :]
+    corr = np.correlate(segment, segment, mode="full")[len(segment) - 1:]
     # ignore very small lags
-    corr[0 : int(sr / 1000)] = 0
+    corr[0:int(sr / 1000)] = 0
     peak = np.argmax(corr)
     if peak <= 0:
         return A4
@@ -191,20 +168,21 @@ def estimate_tempo(audio: np.ndarray, sr: int) -> float:
     frames = max(1, (len(audio) - hop) // hop)
     if frames < 4:
         return 100.0
-    env = [np.sum(audio[i * hop : (i + 1) * hop] ** 2) for i in range(frames)]
+    env = [np.sum(audio[i * hop:(i + 1) * hop] ** 2) for i in range(frames)]
     env = np.array(env)
     env = (env - env.mean()) / (env.std() + 1e-8)
-    corr = np.correlate(env, env, mode="full")[len(env) - 1 :]
+    corr = np.correlate(env, env, mode="full")[len(env) - 1:]
     corr[:2] = 0
     lag = np.argmax(corr[2:400]) + 2
     bpm = 60.0 * sr / (lag * hop)
     return float(np.clip(bpm, 60.0, 180.0))
 
+
 # =========================================================
-# AUDIO LOADER (wav → float OR fallback to pydub)
+# AUDIO LOADER
 # =========================================================
 def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
-    # WAV fast path
+    # try WAV fast path
     try:
         sr, audio = wavfile.read(io.BytesIO(raw))
         if audio.ndim > 1:
@@ -225,11 +203,13 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
     audio = np.array(seg.get_array_of_samples()).astype(np.float32) / 32768.0
     return audio, sr
 
+
 # =========================================================
 # MIDI / HARMONY HELPERS
 # =========================================================
 def midi_note_from_freq(freq: float) -> int:
     return int(69 + 12 * np.log2(freq / 440.0))
+
 
 def degree_to_midi(root_midi: int, deg: str) -> int:
     """Map roman-ish degree to MIDI pitch in a simple major-ish scale."""
@@ -249,6 +229,7 @@ def degree_to_midi(root_midi: int, deg: str) -> int:
         return root_midi + 11
     return root_midi
 
+
 def pick_progression(style: str) -> list[str]:
     style_def = STYLE_SETTINGS.get(style)
     if not style_def:
@@ -258,6 +239,7 @@ def pick_progression(style: str) -> list[str]:
         return ["i", "v", "vi", "iv"]
     return random.choice(progressions)
 
+
 def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
     degrees = pick_progression(style)
     prog = []
@@ -266,20 +248,11 @@ def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
         prog.append(degree_to_midi(root_midi, deg))
     return prog
 
+
 # =========================================================
 # INSTRUMENT RENDERING
 # =========================================================
 def render_midi_band(
-     # make sure soundfont exists (in case startup download failed)
-    if not os.path.exists(SOUNDFONT_PATH):
-        ensure_soundfont_safe()
-    if not os.path.exists(SOUNDFONT_PATH):
-        # still not there → give up with a clear message
-        raise ValueError(
-            f"SoundFont not found at {SOUNDFONT_PATH}. "
-            "Upload it, or set SOUNDFONT_URL to a reachable location."
-        )
-        
     sr: int,
     duration: float,
     bpm: float,
@@ -290,6 +263,19 @@ def render_midi_band(
     use_drums: bool = True,
     use_guitar: bool = False,
 ) -> np.ndarray:
+    """
+    Build a MIDI band (piano, bass, drums, guitar) and synthesize it to audio using FluidR3_GM.
+    """
+
+    # make sure soundfont exists (in case startup download failed)
+    if not os.path.exists(SOUNDFONT_PATH):
+        ensure_soundfont_safe()
+    if not os.path.exists(SOUNDFONT_PATH):
+        raise ValueError(
+            f"SoundFont not found at {SOUNDFONT_PATH}. "
+            "Upload it, or set SOUNDFONT_URL to a reachable location."
+        )
+
     root_midi = midi_note_from_freq(root_freq)
     bar_seconds = 60.0 / bpm * 4
     bars = int(np.ceil(duration / bar_seconds)) + 1
@@ -302,7 +288,6 @@ def render_midi_band(
         piano = pretty_midi.Instrument(program=0)  # Acoustic Grand
         t = 0.0
         for chord_root in progression:
-            # simple triad
             for n in [chord_root, chord_root + 4, chord_root + 7]:
                 note = pretty_midi.Note(
                     velocity=85,
@@ -336,84 +321,57 @@ def render_midi_band(
     # --- Drums ---
     if use_drums:
         drum = pretty_midi.Instrument(program=0, is_drum=True)
-        beat = 60.0 / bpm           # 1 beat (quarter note)
-        half_beat = beat / 2.0      # 8th
+        beat = 60.0 / bpm
+        half_beat = beat / 2.0
         t = 0.0
         pattern = STYLE_SETTINGS.get(style, {}).get("drum_pattern", "kick-snare")
 
         while t < duration:
             if pattern == "afro-groove":
                 # Kick on 1
-                drum.notes.append(
-                    pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1)
-                )
-                # light conga / percussion on the & of 1
-                drum.notes.append(
-                    pretty_midi.Note(velocity=70, pitch=60, start=t + half_beat, end=t + half_beat + 0.08)
-                )
-                # Snare on 2
-                drum.notes.append(
-                    pretty_midi.Note(velocity=105, pitch=38, start=t + beat, end=t + beat + 0.1)
-                )
-                # Percussion on the & of 2
-                drum.notes.append(
-                    pretty_midi.Note(velocity=65, pitch=60, start=t + beat + half_beat, end=t + beat + half_beat + 0.08)
-                )
-                # Kick again on 3 (lighter)
-                drum.notes.append(
-                    pretty_midi.Note(velocity=90, pitch=36, start=t + 2*beat, end=t + 2*beat + 0.08)
-                )
-                # Snare / clap on 4
-                drum.notes.append(
-                    pretty_midi.Note(velocity=110, pitch=39, start=t + 3*beat, end=t + 3*beat + 0.1)
-                )
-
-                # advance by a bar (4 beats)
+                drum.notes.append(pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1))
+                # perc on & of 1
+                drum.notes.append(pretty_midi.Note(velocity=70, pitch=60, start=t + half_beat, end=t + half_beat + 0.08))
+                # snare on 2
+                drum.notes.append(pretty_midi.Note(velocity=105, pitch=38, start=t + beat, end=t + beat + 0.1))
+                # perc on & of 2
+                drum.notes.append(pretty_midi.Note(velocity=65, pitch=60, start=t + beat + half_beat, end=t + beat + half_beat + 0.08))
+                # light kick on 3
+                drum.notes.append(pretty_midi.Note(velocity=90, pitch=36, start=t + 2 * beat, end=t + 2 * beat + 0.08))
+                # clap on 4
+                drum.notes.append(pretty_midi.Note(velocity=110, pitch=39, start=t + 3 * beat, end=t + 3 * beat + 0.1))
                 t += 4 * beat
 
             elif pattern == "one-drop":
-                # reggae-ish
-                drum.notes.append(
-                    pretty_midi.Note(velocity=95, pitch=36, start=t + beat, end=t + beat + 0.1)
-                )
-                drum.notes.append(
-                    pretty_midi.Note(velocity=105, pitch=38, start=t + beat, end=t + beat + 0.1)
-                )
+                drum.notes.append(pretty_midi.Note(velocity=95, pitch=36, start=t + beat, end=t + beat + 0.1))
+                drum.notes.append(pretty_midi.Note(velocity=105, pitch=38, start=t + beat, end=t + beat + 0.1))
                 t += 2 * beat
 
             elif pattern == "four-on-floor":
-                # kick every beat
-                drum.notes.append(
-                    pretty_midi.Note(velocity=100, pitch=36, start=t, end=t + 0.1)
-                )
+                drum.notes.append(pretty_midi.Note(velocity=100, pitch=36, start=t, end=t + 0.1))
                 t += beat
 
             else:
-                # fallback: simple kick-snare
-                drum.notes.append(
-                    pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1)
-                )
-                drum.notes.append(
-                    pretty_midi.Note(velocity=110, pitch=38, start=t + beat, end=t + beat + 0.1)
-                )
+                drum.notes.append(pretty_midi.Note(velocity=110, pitch=36, start=t, end=t + 0.1))
+                drum.notes.append(pretty_midi.Note(velocity=110, pitch=38, start=t + beat, end=t + beat + 0.1))
                 t += 2 * beat
 
         pm.instruments.append(drum)
 
-    # --- Reggae guitar skank (offbeat stabs) ---
+    # --- Reggae / guitar skank ---
     style_wants_skank = STYLE_SETTINGS.get(style, {}).get("guitar_skank", False)
     if use_guitar or style_wants_skank:
-        guitar = pretty_midi.Instrument(program=25)  # Acoustic Guitar (nylon-ish)
+        guitar = pretty_midi.Instrument(program=25)  # Nylon-ish
         tbar = 0.0
         while tbar < duration:
-            for beat_i in range(4):  # 4 beats per bar
+            for beat_i in range(4):
                 beat_start = tbar + (beat_i * (bar_seconds / 4.0))
                 offbeat = beat_start + (bar_seconds / 8.0)
                 if offbeat < duration:
                     guitar.notes.append(
                         pretty_midi.Note(
                             velocity=80,
-                            pitch=root_midi + 7,  # 5th above root
+                            pitch=root_midi + 7,
                             start=offbeat,
                             end=offbeat + 0.12,
                         )
@@ -421,24 +379,18 @@ def render_midi_band(
             tbar += bar_seconds
         pm.instruments.append(guitar)
 
-       # --- Render to WAV via fluidsynth (version-safe) ---
+    # --- Render to WAV via fluidsynth (version-safe) ---
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpwav:
         tmp_path = tmpwav.name
 
     try:
-        # Newer pretty_midi: returns np.array
+        # newer pretty_midi: returns np array
         audio_data = pm.fluidsynth(fs=sr, sf2_path=SOUNDFONT_PATH)
-        # write it ourselves
         sf.write(tmp_path, audio_data, sr)
     except TypeError:
-        # Older pretty_midi that accepted filename=
-        pm.fluidsynth(
-            fs=sr,
-            sf2_path=SOUNDFONT_PATH,
-            filename=tmp_path,
-        )
+        # older pretty_midi that accepted filename=
+        pm.fluidsynth(fs=sr, sf2_path=SOUNDFONT_PATH, filename=tmp_path)
 
-    # now load the rendered accompaniment
     accomp, _ = sf.read(tmp_path)
     return accomp
 
@@ -452,6 +404,7 @@ async def root_ui():
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"detail": "UI not found, but API is running."}
+
 
 @app.post("/generate")
 async def generate(
