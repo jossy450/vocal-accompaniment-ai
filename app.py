@@ -271,6 +271,16 @@ def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
 # INSTRUMENT RENDERING
 # =========================================================
 def render_midi_band(
+     # make sure soundfont exists (in case startup download failed)
+    if not os.path.exists(SOUNDFONT_PATH):
+        ensure_soundfont_safe()
+    if not os.path.exists(SOUNDFONT_PATH):
+        # still not there → give up with a clear message
+        raise ValueError(
+            f"SoundFont not found at {SOUNDFONT_PATH}. "
+            "Upload it, or set SOUNDFONT_URL to a reachable location."
+        )
+        
     sr: int,
     duration: float,
     bpm: float,
