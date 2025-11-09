@@ -18,6 +18,69 @@ import pretty_midi
 from pydub import AudioSegment
 from pydub.utils import which
 
+# =========================================================
+# REMOTE MUSIC MODEL
+# =========================================================
+def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
+    """
+    Calls a hosted AI music model (e.g. Replicate) and returns audio bytes.
+    Adjust payload/keys to match the model you pick.
+    """
+    remote_url = os.environ.get("REMOTE_MUSIC_URL")
+    remote_token = os.environ.get("REMOTE_MUSIC_TOKEN")
+    if not remote_url or not remote_token:
+        return None  # not configured
+
+    # many hosted models want base64 audio
+    vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
+
+    # this is an EXAMPLE payload for a musicgen-like model
+    payload = {
+        "version": "musicgen-or-your-model-version",
+        "input": {
+            "audio": vocal_b64,
+            "prompt": f"backing track, {style}, no lead vocals, high quality, mixed",
+            "duration": 30,  # seconds, or omit if model infers
+        },
+    }
+
+    try:
+        resp = requests.post(
+            remote_url,
+            headers={
+                "Authorization": f"Token {remote_token}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=180,
+        )
+        if resp.status_code not in (200, 201):
+            print("[remote-music] bad status:", resp.status_code, resp.text)
+            return None
+
+        data = resp.json()
+
+        # some providers return an audio URL
+        audio_url = (
+            data.get("output")
+            if isinstance(data.get("output"), str)
+            else None
+        )
+        if audio_url:
+            audio_resp = requests.get(audio_url, timeout=180)
+            if audio_resp.status_code == 200:
+                return audio_resp.content
+
+        # or base64 right away
+        if "audio_b64" in data:
+            return base64.b64decode(data["audio_b64"])
+
+    except Exception as e:
+        print("[remote-music] ERROR:", e)
+
+    return None
+
+
 
 # =========================================================
 # PATHS & GLOBALS
@@ -307,6 +370,35 @@ def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
     return None
 
 
+# ==========================================================
+# MASTERING API
+# ==========================================================
+def call_mastering_api(audio_bytes: bytes) -> bytes | None:
+    """
+    Sends the audio to a mastering/processing API (Auphonic / Dolby).
+    Returns mastered audio bytes, or None if it fails.
+    """
+    master_url = os.environ.get("MASTERING_URL")
+    master_token = os.environ.get("MASTERING_TOKEN")
+    master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
+
+    if not (master_url and master_token and master_enabled):
+        return None  # not configured
+
+    try:
+        files = {"audio": ("mix.wav", audio_bytes, "audio/wav")}
+        headers = {"Authorization": f"Bearer {master_token}"}
+        resp = requests.post(master_url, headers=headers, files=files, timeout=180)
+        if resp.status_code != 200:
+            print("[mastering] bad status:", resp.status_code, resp.text)
+            return None
+        # assuming API returns raw audio — some return JSON with URL instead
+        return resp.content
+    except Exception as e:
+        print("[mastering] ERROR:", e)
+        return None
+
+
 # =========================================================
 # RENDER MIDI BAND
 # =========================================================
@@ -537,22 +629,60 @@ async def generate(
     drums: bool = Query(True),
     guitar: bool = Query(False),
 ):
-    # get raw upload
+    # raw upload (keep this for remote call)
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # ---------- 1) TRY REMOTE AI MODEL ----------
+    # =====================================================
+    # 1) TRY SOPHISTICATED REMOTE MODEL FIRST
+    # =====================================================
     remote_audio = call_remote_music_model(raw, style)
     if remote_audio is not None:
-        # we got ready-made audio from model → stream it
+        # we have a band from the model — now mix it with the original vocal
+        # load vocal
+        vocal, sr = load_audio_from_bytes(raw)
+        # load remote band
+        band, sr_band = load_audio_from_bytes(remote_audio)
+        # resample / align if SR differs
+        if sr_band != sr:
+            # quick-and-dirty: trim to min len
+            min_len = min(len(vocal), len(band))
+            vocal = vocal[:min_len]
+            band = band[:min_len]
+        else:
+            min_len = min(len(vocal), len(band))
+            vocal = vocal[:min_len]
+            band = band[:min_len]
+
+        # light ducking so vocal sits on top
+        band = simple_highpass(band, sr, cutoff=140.0)
+        v_r = rms(vocal)
+        b_r = rms(band)
+        if b_r > 0:
+            band = band * (v_r / (b_r * 1.3))
+        # no complicated sidechain — remote audio already mixed
+        mix = vocal * 0.98 + band * 0.7
+        peak = np.max(np.abs(mix)) + 1e-9
+        if peak > 1.0:
+            mix = mix / peak
+
+        # to bytes
+        buf = io.BytesIO()
+        wavfile.write(buf, sr, (mix * 32767).astype(np.int16))
+        buf.seek(0)
+        mastered = call_mastering_api(buf.getvalue())
+        final_bytes = mastered if mastered is not None else buf.getvalue()
+
         return StreamingResponse(
-            io.BytesIO(remote_audio),
+            io.BytesIO(final_bytes),
             media_type="audio/wav",
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # ---------- 2) FALLBACK TO LOCAL MIDI ENGINE ----------
+    # =====================================================
+    # 2) FALLBACK: YOUR CURRENT LOCAL MIDI ENGINE
+    # =====================================================
     vocal, sr = load_audio_from_bytes(raw)
 
     f0 = estimate_key_freq(vocal, sr)
@@ -573,7 +703,6 @@ async def generate(
         use_guitar=guitar,
     )
 
-    # align + mix (use the improved mix we did)
     min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
     band = band[:min_len]
