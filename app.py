@@ -781,6 +781,19 @@ async def generate(
     # ----- 1) load vocal locally -----
     vocal, sr = load_audio_from_bytes(raw)
 
+    # analyze vocal first
+vocal, sr = load_audio_from_bytes(raw)
+f0 = estimate_key_freq(vocal, sr)
+bpm = estimate_tempo(vocal, sr)
+key_name = rough_key_from_freq(f0)
+
+gospel_prompt = build_gospel_prompt(bpm, key_name)
+
+remote_band_bytes = call_replicate_musicgen_gospel(
+    vocal_bytes=raw,
+    prompt=gospel_prompt,
+    duration=int(len(vocal) / sr) if len(vocal) / sr < 30 else 30,  # cap at 30s
+)
     # analyse vocal
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
