@@ -4,6 +4,8 @@ import tempfile
 import random
 import numpy as np
 import requests
+import json
+import base64
 
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, FileResponse
@@ -251,6 +253,61 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
 
 
 # =========================================================
+# REMOTE GENERATOR CLIENT
+# =========================================================
+
+def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
+    """
+    Call an external AI music/accompaniment model.
+    Returns raw audio bytes (wav/mp3) or None on failure.
+
+    This version is written like a Replicate / generic HTTP model.
+    Adjust the URL/payload to match the provider you choose.
+    """
+    remote_url = os.environ.get("REMOTE_MUSIC_URL")
+    remote_token = os.environ.get("REMOTE_MUSIC_TOKEN")
+
+    if not remote_url or not remote_token:
+        return None  # not configured
+
+    # some APIs like base64 input
+    vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
+
+    payload = {
+        "input_vocal": vocal_b64,
+        "style": style,
+        "tempo": None,
+    }
+
+    try:
+        resp = requests.post(
+            remote_url,
+            headers={"Authorization": f"Bearer {remote_token}"},
+            json=payload,
+            timeout=180,
+        )
+        if resp.status_code != 200:
+            print("[remote-model] bad status:", resp.status_code, resp.text)
+            return None
+
+        data = resp.json()
+        # assume API returns base64 audio
+        if "audio_b64" in data:
+            return base64.b64decode(data["audio_b64"])
+
+        # or a direct URL
+        if "audio_url" in data:
+            audio_resp = requests.get(data["audio_url"], timeout=180)
+            if audio_resp.status_code == 200:
+                return audio_resp.content
+
+    except Exception as e:
+        print("[remote-model] ERROR:", e)
+
+    return None
+
+
+# =========================================================
 # RENDER MIDI BAND
 # =========================================================
 def render_midi_band(
@@ -471,14 +528,6 @@ def render_midi_band(
 # =========================================================
 # ROUTES
 # =========================================================
-@app.get("/")
-async def root_ui():
-    index_path = os.path.join(STATIC_DIR, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"detail": "UI not found, but API is running."}
-
-
 @app.post("/generate")
 async def generate(
     request: Request,
@@ -488,21 +537,30 @@ async def generate(
     drums: bool = Query(True),
     guitar: bool = Query(False),
 ):
+    # get raw upload
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # 1. load vocal
+    # ---------- 1) TRY REMOTE AI MODEL ----------
+    remote_audio = call_remote_music_model(raw, style)
+    if remote_audio is not None:
+        # we got ready-made audio from model → stream it
+        return StreamingResponse(
+            io.BytesIO(remote_audio),
+            media_type="audio/wav",
+            headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+        )
+
+    # ---------- 2) FALLBACK TO LOCAL MIDI ENGINE ----------
     vocal, sr = load_audio_from_bytes(raw)
 
-    # 2. analyse
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
     duration = len(vocal) / sr
 
-    # 3. render band
     band = render_midi_band(
         sr,
         duration,
@@ -515,14 +573,12 @@ async def generate(
         use_guitar=guitar,
     )
 
-    # 4. align lengths
+    # align + mix (use the improved mix we did)
     min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
     band = band[:min_len]
 
-    # 5. mix (HPF + loudness match + ducking)
     band = simple_highpass(band, sr, cutoff=140.0)
-
     v_r = rms(vocal)
     b_r = rms(band)
     if b_r > 0:
@@ -537,12 +593,10 @@ async def generate(
     band = band * band_gain
 
     mix = vocal * 0.98 + band * 0.9
-
     peak = np.max(np.abs(mix)) + 1e-9
     if peak > 1.0:
         mix = mix / peak
 
-    # 6. return WAV
     out_buf = io.BytesIO()
     wavfile.write(out_buf, sr, (mix * 32767).astype(np.int16))
     out_buf.seek(0)
@@ -550,5 +604,5 @@ async def generate(
     return StreamingResponse(
         out_buf,
         media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename=\"accompaniment.wav\"'},
+        headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
     )
