@@ -21,40 +21,6 @@ from pydub import AudioSegment
 from pydub.utils import which
 
 
-def replicate_upload_file(audio_bytes: bytes) -> str | None:
-    """
-    Upload user vocal to Replicate so musicgen can condition on it.
-    """
-    api_token = os.environ.get("REPLICATE_API_TOKEN")
-    if not api_token:
-        print("[replicate-upload] missing token")
-        return None
-
-    url = "https://api.replicate.com/v1/files"
-    headers = {
-        "Authorization": f"Token {api_token}",
-    }
-
-    # IMPORTANT: field name must be "content"
-    files = {
-        "content": ("vocal.wav", audio_bytes, "audio/wav"),
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, files=files, timeout=60)
-        if resp.status_code != 200:
-            print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
-            return None
-        data = resp.json()
-        file_id = data.get("id")
-        if not file_id:
-            print("[replicate-upload] no id in response:", data)
-            return None
-        return f"replicate://{file_id}"
-    except Exception as e:
-        print("[replicate-upload] ERROR:", e)
-        return None
-
 
 # =========================================================
 # BASIC PATHS
@@ -426,35 +392,38 @@ REPLICATE_MODEL_VERSION = os.environ.get(
     "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
 )
 
+
 def replicate_upload_file(audio_bytes: bytes) -> str | None:
     """
-    Upload a file to Replicate and return its file URI, e.g. 'replicate://file-abc123'.
+    Upload the user vocal to Replicate and get back a replicate://file-... URI.
+    The field name MUST be 'content' or Replicate returns 400 Missing content.
     """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     if not api_token:
         print("[replicate-upload] missing token")
         return None
 
-    files_url = "https://api.replicate.com/v1/files"
+    url = "https://api.replicate.com/v1/files"
     headers = {
         "Authorization": f"Token {api_token}",
     }
-
     files = {
-        "file": ("vocal.wav", audio_bytes, "audio/wav"),
+        # 👇 this name is the important part
+        "content": ("vocal.wav", audio_bytes, "audio/wav"),
     }
 
     try:
-        resp = requests.post(files_url, headers=headers, files=files, timeout=60)
+        resp = requests.post(url, headers=headers, files=files, timeout=60)
         if resp.status_code != 200:
             print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
             return None
+
         data = resp.json()
-        # Replicate returns an id like "file-xxxxx"
         file_id = data.get("id")
         if not file_id:
-            print("[replicate-upload] no file id in response:", data)
+            print("[replicate-upload] no id in resp:", data)
             return None
+
         return f"replicate://{file_id}"
     except Exception as e:
         print("[replicate-upload] ERROR:", e)
@@ -468,34 +437,41 @@ def call_replicate_musicgen_follow_vocal(
     key: str | None,
     duration: int = 30,
 ) -> bytes | None:
+    """
+    1. upload vocal to Replicate → get replicate://file-...
+    2. call musicgen on Replicate with that file as input_audio
+    3. download the generated wav and return its bytes
+    """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     if not api_token:
-        print("[replicate] token missing")
+        print("[replicate] REPLICATE_API_TOKEN missing")
         return None
 
-    # upload the vocal first
+    # 1) upload
     input_audio_uri = replicate_upload_file(vocal_bytes)
     if not input_audio_uri:
         print("[replicate] could not upload input audio")
         return None
 
-    # rich prompt
+    # 2) build a rich prompt
     base_parts = [
-        "Nigerian gospel / West African worship full band backing track",
-        "grand piano, bass guitar, live drums, gentle pads, light guitar",
-        "no vocals, instrumental accompaniment only",
-        "studio quality, radio mix",
+        "West African / Nigerian gospel worship backing track",
+        "full band: piano, bass guitar, live drums, soft pads, optional guitar",
+        "no vocals, instrumental only, studio / radio mix",
     ]
+    # reuse your style-aware prompt
     style_prompt = build_style_prompt(style, bpm=bpm, key=key)
     base_parts.append(style_prompt)
     if bpm:
         base_parts.append(f"{int(bpm)} BPM")
     if key:
         base_parts.append(f"in key of {key}")
-    full_prompt = ", ".join(base_parts)
+    prompt = ", ".join(base_parts)
 
+    # 3) model version – keep yours or this one
     model_version = os.environ.get(
         "REPLICATE_MODEL_VERSION",
+        # a musicgen version – adjust to what you’ve set in Railway
         "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
     )
 
@@ -507,7 +483,7 @@ def call_replicate_musicgen_follow_vocal(
     payload = {
         "version": model_version,
         "input": {
-            "prompt": full_prompt,
+            "prompt": prompt,
             "input_audio": input_audio_uri,
             "duration": duration,
             "output_format": "wav",
@@ -516,38 +492,39 @@ def call_replicate_musicgen_follow_vocal(
     }
 
     try:
+        # create prediction
         resp = requests.post(url, headers=headers, json=payload, timeout=40)
         if resp.status_code not in (200, 201):
             print("[replicate] create failed:", resp.text[:200])
             return None
 
-        pred = resp.json()
-        poll_url = f"{url}/{pred['id']}"
-        status = pred["status"]
+        prediction = resp.json()
+        pred_id = prediction["id"]
+        status = prediction["status"]
+        poll_url = f"{url}/{pred_id}"
 
+        # poll until done
         import time
         while status not in ("succeeded", "failed", "canceled"):
             time.sleep(3)
             pr = requests.get(poll_url, headers=headers, timeout=40)
-            pred = pr.json()
-            status = pred.get("status", "")
+            prediction = pr.json()
+            status = prediction.get("status", "")
 
         if status != "succeeded":
-            print("[replicate] prediction failed:", pred)
+            print("[replicate] prediction failed:", prediction)
             return None
 
-        output = pred.get("output")
+        output = prediction.get("output")
+        # could be a list or string
         audio_url = output[0] if isinstance(output, list) else output
         audio_resp = requests.get(audio_url, timeout=60)
         if audio_resp.status_code == 200:
             return audio_resp.content
     except Exception as e:
         print("[replicate] ERROR:", e)
-        return None
 
     return None
-
-
 
 
 
