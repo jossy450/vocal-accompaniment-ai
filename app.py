@@ -271,6 +271,35 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
     return y
 
 
+def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
+    """Call your HF Space, log ANY error, but never crash."""
+    url = os.environ.get("HF_MUSICGEN_URL")
+    if not url:
+        print("[hf-musicgen] HF_MUSICGEN_URL not set")
+        return None
+
+    try:
+        payload = {
+            "data": [
+                prompt,
+                duration,
+            ]
+        }
+        resp = requests.post(url, json=payload, timeout=180)
+        if resp.status_code != 200:
+            # 👇 keep the exact message so you can debug
+            print(f"[hf-musicgen] bad status: {resp.status_code} {resp.text[:200]}")
+            return None
+
+        # Spaces usually return binary audio directly OR a gradio-style dict;
+        # your previous code used load_audio_from_bytes, so we just return resp.content
+        return resp.content
+
+    except Exception as e:
+        print("[hf-musicgen] ERROR calling space:", e)
+        return None
+
+
 # =========================================================
 # MASTERING (remote → local fallback)
 # =========================================================
@@ -887,11 +916,11 @@ async def generate(
         )
 
     # 2) if Replicate failed: try your HF Space (only if it’s up)
-    hf_band = call_hf_musicgen(
+    hf_band = call_hf_musicgen_safe(
         vocal_bytes=raw,
         prompt=build_style_prompt(style, bpm=ai_bpm, key=key_name),
         duration=max_dur_sec,
-    )
+        )
     if hf_band is not None:
         band_audio, band_sr = load_audio_from_bytes(hf_band)
         if band_sr != sr:
