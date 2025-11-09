@@ -414,7 +414,7 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
 
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=60)
-        if resp.status_code != 200:
+        if resp.status_code not in (200, 201):
             print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
             return None
 
