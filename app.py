@@ -409,7 +409,7 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
 
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=60)
-        # accept 200 or 201
+        # Replicate returns 201 Created
         if resp.status_code not in (200, 201):
             print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
             return None
@@ -420,12 +420,14 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
             print("[replicate-upload] no id in resp:", data)
             return None
 
-        # ✅ this is the SUCCESS return (outside the if)
-        return f"replicate://{file_id}"
+        # ⬇️ THIS is the important change
+        # the model wants a URI, so give it the HTTPS URL for the file
+        return f"https://api.replicate.com/v1/files/{file_id}"
 
     except Exception as e:
         print("[replicate-upload] ERROR:", e)
         return None
+
 
 
 def call_replicate_musicgen_follow_vocal(
