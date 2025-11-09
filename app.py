@@ -620,6 +620,14 @@ async def root_ui():
     return {"detail": "UI not found, but API is running."}
 
 
+# small helper to turn np audio → wav bytes
+def _to_wav_bytes(audio: np.ndarray, sr: int) -> bytes:
+    buf = io.BytesIO()
+    wavfile.write(buf, sr, (audio * 32767).astype(np.int16))
+    buf.seek(0)
+    return buf.getvalue()
+
+
 @app.post("/generate")
 async def generate(
     request: Request,
@@ -629,91 +637,62 @@ async def generate(
     drums: bool = Query(True),
     guitar: bool = Query(False),
 ):
+    # ------------------ 1. get audio ------------------
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "No audio data received")
 
     vocal, sr = load_audio_from_bytes(raw)
 
-    # analyse vocal
+    # ------------------ 2. analyse vocal ------------------
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
 
-    # 1) try Replicate musicgen with style-aware prompt
-replicate_band = call_replicate_musicgen(
-    vocal_bytes=raw,
-    style=style,
-    bpm=bpm,
-    key=key_name,
-    duration=int(min(len(vocal) / sr, 30)),
-)
-
-if replicate_band is not None:
-    # decode remote band to np audio
-    band_audio, band_sr = load_audio_from_bytes(replicate_band)
-
-    # resample to vocal sr if needed
-    if band_sr != sr:
-        band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
-
-    # light align (they're AI-generated, usually close)
-    band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
-
-    # match loudness
-    v_r = rms(vocal); b_r = rms(band_audio)
-    if b_r > 0:
-        band_audio = band_audio * (v_r / (b_r * 1.4))
-
-    mix = vocal * 1.0 + band_audio * 0.8
-    # safety limiter
-    peak = np.max(np.abs(mix)) + 1e-9
-    if peak > 1.0:
-        mix = mix / peak
-
-    out_buf = io.BytesIO()
-    wavfile.write(out_buf, sr, (mix * 32767).astype(np.int16))
-    out_buf.seek(0)
-    return StreamingResponse(
-        out_buf,
-        media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+    # ------------------ 3. try Replicate first ------------------
+    # this uses the token you set in Railway
+    replicate_band_bytes = call_replicate_musicgen(
+        vocal_bytes=raw,
+        style=style,
+        bpm=bpm,
+        key=key_name,
+        duration=int(min(len(vocal) / sr, 30)),
     )
-    # 1) try Replicate (the sophisticated way)
-    gospel_prompt = build_gospel_prompt(bpm, key_name)
-    remote_duration = min(int(len(vocal) / sr) + 2, 30)
-    remote_bytes = call_replicate_musicgen(raw, gospel_prompt, duration=remote_duration)
 
-    if remote_bytes is not None:
-        # align to vocal length
-        band, band_sr = load_audio_from_bytes(remote_bytes)
+    if replicate_band_bytes is not None:
+        # decode remote band to numpy audio
+        band_audio, band_sr = load_audio_from_bytes(replicate_band_bytes)
+
+        # resample to match vocal
         if band_sr != sr:
-            band = librosa.resample(band, orig_sr=band_sr, target_sr=sr)
+            band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
 
-        # simple align (same BPM for now)
-        min_len = min(len(vocal), len(band))
-        vocal = vocal[:min_len]
-        band = band[:min_len]
+        # light cleanup
+        band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
 
-        band = simple_highpass(band, sr, cutoff=130.0)
+        # match loudness to vocal
         v_r = rms(vocal)
-        b_r = rms(band)
+        b_r = rms(band_audio)
         if b_r > 0:
-            band = band * (v_r / (b_r * 1.4))
+            band_audio = band_audio * (v_r / (b_r * 1.4))
 
-        mix = vocal + 0.75 * band
+        # mix
+        mix = vocal * 1.0 + band_audio * 0.8
         peak = np.max(np.abs(mix)) + 1e-9
         if peak > 1.0:
             mix = mix / peak
 
+        # optional mastering
         mastered = call_mastering_api(_to_wav_bytes(mix, sr))
+        final_bytes = mastered if mastered is not None else _to_wav_bytes(mix, sr)
+
         return StreamingResponse(
-            io.BytesIO(mastered),
+            io.BytesIO(final_bytes),
             media_type="audio/wav",
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # 2) FALLBACK → local MIDI
+    # ------------------ 4. FALLBACK → local MIDI engine ------------------
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
     duration = len(vocal) / sr
@@ -730,10 +709,12 @@ if replicate_band is not None:
         use_guitar=guitar,
     )
 
+    # trim to same length
     min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
     band = band[:min_len]
 
+    # shape band & loudness
     band = simple_highpass(band, sr, cutoff=130.0)
     v_r = rms(vocal)
     b_r = rms(band)
@@ -746,16 +727,10 @@ if replicate_band is not None:
         mix = mix / peak
 
     mastered = call_mastering_api(_to_wav_bytes(mix, sr))
+    final_bytes = mastered if mastered is not None else _to_wav_bytes(mix, sr)
+
     return StreamingResponse(
-        io.BytesIO(mastered),
+        io.BytesIO(final_bytes),
         media_type="audio/wav",
         headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
     )
-
-
-# small helper to turn np audio → wav bytes
-def _to_wav_bytes(audio: np.ndarray, sr: int) -> bytes:
-    buf = io.BytesIO()
-    wavfile.write(buf, sr, (audio * 32767).astype(np.int16))
-    buf.seek(0)
-    return buf.getvalue()
