@@ -394,10 +394,6 @@ REPLICATE_MODEL_VERSION = os.environ.get(
 
 
 def replicate_upload_file(audio_bytes: bytes) -> str | None:
-    """
-    Upload the user vocal to Replicate and get back a replicate://file-... URI.
-    The field name MUST be 'content' or Replicate returns 400 Missing content.
-    """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     if not api_token:
         print("[replicate-upload] missing token")
@@ -408,12 +404,12 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
         "Authorization": f"Token {api_token}",
     }
     files = {
-        # 👇 this name is the important part
         "content": ("vocal.wav", audio_bytes, "audio/wav"),
     }
 
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=60)
+        # accept 200 or 201
         if resp.status_code not in (200, 201):
             print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
             return None
@@ -423,8 +419,13 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
         if not file_id:
             print("[replicate-upload] no id in resp:", data)
             return None
-            
-            return f"replicate://{data['id']}"
+
+        # ✅ this is the SUCCESS return (outside the if)
+        return f"replicate://{file_id}"
+
+    except Exception as e:
+        print("[replicate-upload] ERROR:", e)
+        return None
 
 
 def call_replicate_musicgen_follow_vocal(
