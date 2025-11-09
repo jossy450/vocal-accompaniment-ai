@@ -277,23 +277,49 @@ def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
 # MASTERING (optional)
 # =========================================================
 def call_mastering_api(audio_bytes: bytes) -> bytes | None:
+    """
+    Master the audio using Auphonic.
+
+    Expects these env vars:
+      MASTERING_ENABLED=true
+      MASTERING_URL=https://auphonic.com/api/simple/productions.json
+      MASTERING_TOKEN= sOmuFXlhpryFuxzh7AQsWRN4c3JKtbMP
+
+    This uses Auphonic's "simple" endpoint, which returns the processed file
+    directly when 'output_files' is set to 'wav'.
+    """
+    master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
     master_url = os.environ.get("MASTERING_URL")
     master_token = os.environ.get("MASTERING_TOKEN")
-    master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
 
-    if not (master_url and master_token and master_enabled):
-        return None
+    if not master_enabled or not master_url or not master_token:
+        return None  # mastering not configured
 
     try:
-        files = {"audio": ("mix.wav", audio_bytes, "audio/wav")}
-        headers = {"Authorization": f"Bearer {master_token}"}
-        resp = requests.post(master_url, headers=headers, files=files, timeout=180)
+        # Auphonic simple API accepts multipart:
+        #   audio_file     -> the file to process
+        #   output_files[] -> format (e.g. wav, mp3)
+        #   token          -> your personal API token
+        files = {
+            "audio_file": ("mix.wav", audio_bytes, "audio/wav"),
+        }
+        data = {
+            "token": master_token,
+            # request WAV back
+            "output_files[]": "wav",
+        }
+
+        resp = requests.post(master_url, data=data, files=files, timeout=180)
         if resp.status_code != 200:
-            print("[mastering] bad status:", resp.status_code, resp.text)
+            print("[mastering] Auphonic error:", resp.status_code, resp.text[:300])
             return None
+
+        # Auphonic simple API actually returns the processed file in the body
+        # if you asked for a single file. So we just return resp.content
         return resp.content
+
     except Exception as e:
-        print("[mastering] ERROR:", e)
+        print("[mastering] ERROR calling Auphonic:", e)
         return None
 
 
