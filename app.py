@@ -692,51 +692,74 @@ async def generate(
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
 
-    # build a genre-aware prompt (we already wrote this helper earlier)
-    prompt = build_gospel_prompt(bpm, key_name) if "gospel" in style else f"{style} afrobeat backing track, no vocals"
+    # adjust tempo a bit based on style (like your MIDI fallback does)
+    style_def = STYLE_SETTINGS.get(style, {})
+    ai_bpm = bpm * style_def.get("tempo_mult", 1.0)
+
+    # max length we’ll ask the AI model for
+    max_dur_sec = int(min(len(vocal) / sr, 30))
+
+    # build a descriptive prompt for the models
+    style_prompt = build_style_prompt(style, bpm=ai_bpm, key=key_name)
+
+    # this will hold the AI accompaniment bytes if any of the remote calls work
+    accomp_bytes: bytes | None = None
 
     # ------------------ 3. try Replicate first ------------------
-    replicate_band = call_replicate_musicgen(
+    accomp_bytes = call_replicate_musicgen(
         vocal_bytes=raw,
         style=style,
-        bpm=bpm,
+        bpm=ai_bpm,
         key=key_name,
-        duration=int(min(len(vocal) / sr, 30)),
+        duration=max_dur_sec,
     )
 
-# If Replicate fails or returns None → try Hugging Face
-if not replicate_band_bytes:
-    print("⚠️ Replicate failed, switching to Hugging Face fallback...")
+    # ------------------ 4. if Replicate failed → try simple HF model ------------------
+    if accomp_bytes is None:
+        print("⚠️ Replicate failed, trying Hugging Face musicgen-melody fallback...")
+        try:
+            hf_io = call_hf_musicgen_fallback(
+                vocal_bytes=raw,
+                prompt=style_prompt,
+                duration=max_dur_sec,
+            )
+            if hf_io is not None:
+                accomp_bytes = hf_io.read()
+        except Exception as e:
+            print("❌ HF musicgen-melody fallback error:", e)
 
-    try:
-        hf_audio = call_hf_musicgen_fallback(
+    # ------------------ 5. if that also failed → try your HF Space endpoint ------------------
+    if accomp_bytes is None:
+        print("⚠️ HF fallback also missing, trying HF Space (if configured)...")
+        space_bytes = call_hf_musicgen(
             vocal_bytes=raw,
-            prompt=f"{style} backing track with {key_name} key at {bpm:.1f} BPM",
-            duration=int(min(len(vocal) / sr, 30))
+            prompt=style_prompt,
+            duration=max_dur_sec,
         )
-        if hf_audio is not None:
-            print("✅ Hugging Face fallback succeeded.")
-            replicate_band_bytes = hf_audio.read()
-        else:
-            print("❌ Hugging Face fallback returned None.")
-    except Exception as e:
-        print("❌ Error calling Hugging Face fallback:", str(e))
+        if space_bytes is not None:
+            accomp_bytes = space_bytes
 
-    
-    if replicate_band is not None:
-        print("[pipeline] using Replicate result")
-        band_audio, band_sr = load_audio_from_bytes(replicate_band)
+    # ------------------ 6. if ANY remote model worked → mix and return ------------------
+    if accomp_bytes is not None:
+        band_audio, band_sr = load_audio_from_bytes(accomp_bytes)
+
+        # resample to match vocal
         if band_sr != sr:
             band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
 
-        # mix
+        # gentle highpass to keep kick/bass from fighting the vocal
         band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
-        v_r = rms(vocal); b_r = rms(band_audio)
+
+        # level-match accompaniment to vocal
+        v_r = rms(vocal)
+        b_r = rms(band_audio)
         if b_r > 0:
             band_audio = band_audio * (v_r / (b_r * 1.4))
 
         mix = vocal + 0.8 * band_audio
-        peak = np.max(np.abs(mix)) + 1e-9
+
+        # safety normalize
+        peak = float(np.max(np.abs(mix)) + 1e-9)
         if peak > 1.0:
             mix = mix / peak
 
@@ -746,45 +769,14 @@ if not replicate_band_bytes:
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # ------------------ 4. Replicate failed → try Hugging Face Space ------------------
-    hf_band = call_hf_musicgen(
-        vocal_bytes=raw,
-        prompt=prompt,
-        duration=int(min(len(vocal) / sr, 30)),
-    )
-    if hf_band is not None:
-        print("[pipeline] using HF Space result")
-        band_audio, band_sr = load_audio_from_bytes(hf_band)
-        if band_sr != sr:
-            band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
-
-        # mix
-        band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
-        v_r = rms(vocal); b_r = rms(band_audio)
-        if b_r > 0:
-            band_audio = band_audio * (v_r / (b_r * 1.4))
-
-        mix = vocal + 0.75 * band_audio
-        peak = np.max(np.abs(mix)) + 1e-9
-        if peak > 1.0:
-            mix = mix / peak
-
-        return StreamingResponse(
-            io.BytesIO(_to_wav_bytes(mix, sr)),
-            media_type="audio/wav",
-            headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
-        )
-
-    # ------------------ 5. HF also failed → FALLBACK to local MIDI ------------------
-    print("[pipeline] both Replicate and HF failed → using local MIDI")
-    style_def = STYLE_SETTINGS.get(style, {})
-    bpm *= style_def.get("tempo_mult", 1.0)
+    # ------------------ 7. all remote options failed → local MIDI fallback ------------------
+    print("[pipeline] all remote backends failed → using local MIDI band")
     duration = len(vocal) / sr
 
     band = render_midi_band(
         sr,
         duration,
-        bpm,
+        ai_bpm,
         f0,
         style,
         use_piano=piano,
@@ -793,17 +785,20 @@ if not replicate_band_bytes:
         use_guitar=guitar,
     )
 
+    # match lengths
     min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
     band = band[:min_len]
 
+    # same mixing logic
     band = simple_highpass(band, sr, cutoff=130.0)
-    v_r = rms(vocal); b_r = rms(band)
+    v_r = rms(vocal)
+    b_r = rms(band)
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
     mix = vocal + 0.85 * band
-    peak = np.max(np.abs(mix)) + 1e-9
+    peak = float(np.max(np.abs(mix)) + 1e-9)
     if peak > 1.0:
         mix = mix / peak
 
