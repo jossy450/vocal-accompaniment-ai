@@ -38,26 +38,25 @@ def build_gospel_prompt(bpm: float, key: str | None) -> str:
 # =========================================================
 # REMOTE MUSIC MODEL
 # =========================================================
-def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
+def call_remote_gospel_model(vocal_bytes: bytes, bpm: float, key: str | None) -> bytes | None:
     """
-    Calls a hosted AI music model (e.g. Replicate) and returns audio bytes.
-    Adjust payload/keys to match the model you pick.
+    Calls a remote music generator (e.g. Replicate/HF) with a gospel/worship prompt.
     """
     remote_url = os.environ.get("REMOTE_MUSIC_URL")
     remote_token = os.environ.get("REMOTE_MUSIC_TOKEN")
     if not remote_url or not remote_token:
-        return None  # not configured
+        return None
 
-    # many hosted models want base64 audio
     vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
+    prompt = build_gospel_prompt(bpm, key)
 
-    # this is an EXAMPLE payload for a musicgen-like model
     payload = {
-        "version": "musicgen-or-your-model-version",
+        # adjust these keys to match the model you actually pick
+        "version": "gospel-musicgen-v1",
         "input": {
-            "audio": vocal_b64,
-            "prompt": f"backing track, {style}, no lead vocals, high quality, mixed",
-            "duration": 30,  # seconds, or omit if model infers
+            "prompt": prompt,
+            "audio": vocal_b64,         # some models call this “melody” or “input_audio”
+            "duration": 35,             # worship is usually longer; shorten if model limits
         },
     }
 
@@ -72,31 +71,25 @@ def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
             timeout=180,
         )
         if resp.status_code not in (200, 201):
-            print("[remote-music] bad status:", resp.status_code, resp.text)
+            print("[remote-gospel] bad status:", resp.status_code, resp.text)
             return None
 
         data = resp.json()
 
-        # some providers return an audio URL
-        audio_url = (
-            data.get("output")
-            if isinstance(data.get("output"), str)
-            else None
-        )
-        if audio_url:
-            audio_resp = requests.get(audio_url, timeout=180)
+        # common pattern: output is a URL
+        if isinstance(data.get("output"), str):
+            audio_resp = requests.get(data["output"], timeout=180)
             if audio_resp.status_code == 200:
                 return audio_resp.content
 
-        # or base64 right away
+        # or base64
         if "audio_b64" in data:
             return base64.b64decode(data["audio_b64"])
 
     except Exception as e:
-        print("[remote-music] ERROR:", e)
+        print("[remote-gospel] ERROR:", e)
 
     return None
-
 
 
 # =========================================================
