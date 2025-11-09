@@ -8,3 +8,4 @@ pyfluidsynth
 pretty_midi
 mido
 requests
+librosa
