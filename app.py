@@ -289,6 +289,55 @@ REPLICATE_MODEL_VERSION = os.environ.get(
     "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
 )
 
+def build_style_prompt(style: str, bpm: float | None, key: str | None) -> str:
+    """
+    Turn our app style name into a descriptive, musicgen-friendly prompt.
+    This is what makes the remote model sound closer to the genre.
+    """
+    style = (style or "nigerian_gospel").lower()
+    base_parts = []
+
+    # --- style-specific wording ---
+    if style in ("nigerian_gospel", "gospel", "worship"):
+        base_parts.append(
+            "slow Nigerian gospel / worship backing track, warm grand piano, soft live drums, deep bass, mild organ, atmospheric pads, no lead vocals, clean mix"
+        )
+    elif style in ("afrobeat", "afrobeats"):
+        base_parts.append(
+            "modern afrobeats instrumental, West African groove, punchy kick, rimshots, guitar licks, mellow synths, no vocals"
+        )
+    elif style in ("hi_life", "highlife"):
+        base_parts.append(
+            "West African highlife band, bright electric guitars, light percussion, congas, bass guitar, no vocals"
+        )
+    elif style in ("reggae",):
+        base_parts.append(
+            "laid-back reggae riddim, one-drop drums, offbeat guitar skank, round bass, no vocals"
+        )
+    elif style in ("rnb", "r&b"):
+        base_parts.append(
+            "smooth R&B backing track, Rhodes piano, soft drums, sub bass, no vocals, wide stereo"
+        )
+    elif style in ("hip_hop", "rap"):
+        base_parts.append(
+            "modern hip hop / afro-fusion beat, tight drums, 808 bass, plucks, no vocals"
+        )
+    else:
+        # generic fallback
+        base_parts.append(
+            "contemporary Christian / inspirational backing track, piano, bass, drums, no vocals"
+        )
+
+    # --- timing & key hints ---
+    if bpm:
+        base_parts.append(f"{int(bpm)} BPM")
+    if key:
+        base_parts.append(f"in key of {key}")
+
+    # a little production hint
+    base_parts.append("studio mix, balanced, ready for vocals")
+
+    return ", ".join(base_parts)
 
 def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
     base = (
