@@ -360,34 +360,28 @@ def call_replicate_musicgen(
     duration: int = 30,
 ) -> bytes | None:
     """
-    Call Replicate's MusicGen (or similar) WITHOUT using /v1/files.
-    We embed the vocal as a data: URL so we don't depend on the upload endpoint.
-
-    If the model refuses the input, we just return None.
+    Calls the Meta MusicGen model on Replicate to create a realistic instrumental
+    accompaniment matching the given vocal.
     """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     model_version = os.environ.get(
         "REPLICATE_MODEL_VERSION",
-        # fallback to a public musicgen version — change to your actual model
-        "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
+        "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
     )
+
     if not api_token:
         print("[replicate] missing REPLICATE_API_TOKEN")
         return None
 
-    # build a nice prompt
-    parts = [
-        f"{style} backing track",
-        "no lead vocal",
-        "tight timing",
-    ]
+    # Build a smart prompt
+    parts = [f"{style} gospel backing track", "live instruments", "studio mix", "no vocals"]
     if bpm:
         parts.append(f"{int(bpm)} BPM")
     if key:
         parts.append(f"in the key of {key}")
     prompt = ", ".join(parts)
 
-    # turn the vocal into a data URL
+    # Convert the uploaded vocal to base64 data URL
     vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
     data_url = f"data:audio/wav;base64,{vocal_b64}"
 
@@ -399,58 +393,49 @@ def call_replicate_musicgen(
     payload = {
         "version": model_version,
         "input": {
-            # these key names may differ a bit per model — adjust to your chosen MusicGen
             "prompt": prompt,
-            "input_audio": data_url,   # <— the important change
-            "duration": duration,
+            "input_audio": data_url,
             "output_format": "wav",
+            "model_version": "stereo-large",
+            "normalization_strategy": "peak",
+            "duration": duration,
         },
     }
 
     try:
-        # 1) create prediction
-        create = requests.post(url, headers=headers, data=json.dumps(payload), timeout=40)
-        if create.status_code not in (200, 201):
-            print("[replicate] create failed:", create.status_code, create.text)
+        resp = requests.post(url, headers=headers, json=payload, timeout=40)
+        if resp.status_code not in (200, 201):
+            print("[replicate] request failed:", resp.text)
             return None
 
-        pred = create.json()
-        pred_id = pred["id"]
-        status = pred["status"]
+        pred = resp.json()
+        pred_id = pred.get("id")
+        status = pred.get("status", "")
 
-        # 2) poll until done
+        # Poll until ready
         poll_url = f"{url}/{pred_id}"
         while status not in ("succeeded", "failed", "canceled"):
-            poll = requests.get(poll_url, headers=headers, timeout=40)
-            pred = poll.json()
-            status = pred["status"]
+            time.sleep(5)
+            poll_resp = requests.get(poll_url, headers=headers)
+            pred = poll_resp.json()
+            status = pred.get("status", "")
 
         if status != "succeeded":
-            print("[replicate] prediction failed:", pred)
+            print("[replicate] failed:", pred)
             return None
 
-        # 3) download result
         output = pred.get("output")
-        if not output:
-            return None
-
-        # some models return a list of urls
         if isinstance(output, list):
-            audio_url = output[0]
+            output_url = output[0]
         else:
-            audio_url = output
+            output_url = output
 
-        audio_resp = requests.get(audio_url, timeout=60)
-        if audio_resp.status_code == 200:
-            return audio_resp.content
-
-        print("[replicate] could not download audio:", audio_resp.status_code)
-        return None
+        audio_data = requests.get(output_url).content
+        return audio_data
 
     except Exception as e:
         print("[replicate] ERROR:", e)
         return None
-
 
 
 
