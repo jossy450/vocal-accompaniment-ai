@@ -21,6 +21,23 @@ from pydub.utils import which
 # =========================================================
 # REMOTE MUSIC MODEL
 # =========================================================
+
+def build_gospel_prompt(bpm: float, key: str | None) -> str:
+    base = (
+        "slow Nigerian gospel / worship backing track, warm piano, soft drums, "
+        "subtle bass, ambient pads, no lead vocals, mixed and spatial, "
+        "tight timing, congregational feel"
+    )
+    parts = [base]
+    if bpm:
+        parts.append(f"{int(bpm)} BPM")
+    if key:
+        parts.append(f"in key of {key}")
+    return ", ".join(parts)
+
+# =========================================================
+# REMOTE MUSIC MODEL
+# =========================================================
 def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
     """
     Calls a hosted AI music model (e.g. Replicate) and returns audio bytes.
