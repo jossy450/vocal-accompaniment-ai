@@ -352,7 +352,17 @@ def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
     return ", ".join(parts)
 
 
-def call_replicate_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
+def call_replicate_musicgen(
+    vocal_bytes: bytes,
+    style: str,
+    bpm: float | None,
+    key: str | None,
+    duration: int = 30,
+) -> bytes | None:
+    """
+    Style-aware Replicate call.
+    """
+    prompt = build_style_prompt(style, bpm, key)
     """
     Generate music with Replicate meta/musicgen (melody).
     Updated 2025-compatible upload flow.
@@ -364,6 +374,7 @@ def call_replicate_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30)
 
     headers = {"Authorization": f"Token {api_token}"}
 
+   
     try:
         # STEP 1 — Request a presigned upload URL
         presign_resp = requests.post(
