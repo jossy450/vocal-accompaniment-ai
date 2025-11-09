@@ -640,6 +640,45 @@ async def generate(
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
 
+    # 1) try Replicate musicgen with style-aware prompt
+replicate_band = call_replicate_musicgen(
+    vocal_bytes=raw,
+    style=style,
+    bpm=bpm,
+    key=key_name,
+    duration=int(min(len(vocal) / sr, 30)),
+)
+
+if replicate_band is not None:
+    # decode remote band to np audio
+    band_audio, band_sr = load_audio_from_bytes(replicate_band)
+
+    # resample to vocal sr if needed
+    if band_sr != sr:
+        band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
+
+    # light align (they're AI-generated, usually close)
+    band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
+
+    # match loudness
+    v_r = rms(vocal); b_r = rms(band_audio)
+    if b_r > 0:
+        band_audio = band_audio * (v_r / (b_r * 1.4))
+
+    mix = vocal * 1.0 + band_audio * 0.8
+    # safety limiter
+    peak = np.max(np.abs(mix)) + 1e-9
+    if peak > 1.0:
+        mix = mix / peak
+
+    out_buf = io.BytesIO()
+    wavfile.write(out_buf, sr, (mix * 32767).astype(np.int16))
+    out_buf.seek(0)
+    return StreamingResponse(
+        out_buf,
+        media_type="audio/wav",
+        headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+    )
     # 1) try Replicate (the sophisticated way)
     gospel_prompt = build_gospel_prompt(bpm, key_name)
     remote_duration = min(int(len(vocal) / sr) + 2, 30)
