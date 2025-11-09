@@ -2,8 +2,8 @@ import os
 import io
 import tempfile
 import random
-import json
 import base64
+import json
 
 import numpy as np
 import requests
@@ -22,7 +22,7 @@ from pydub.utils import which
 
 
 # =========================================================
-# PATHS & APP
+# BASIC PATHS
 # =========================================================
 BASE_DIR = os.path.dirname(__file__)
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -31,15 +31,20 @@ SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
 os.makedirs(SOUNDFONT_DIR, exist_ok=True)
 SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
 
-# GitHub-hosted soundfont (can be overridden in Railway)
-SOUNDFONT_URL = os.environ.get(
-    "SOUNDFONT_URL",
-    "https://github.com/jossy450/vocal-accompaniment-ai/releases/download/soundfont-v1/FluidR3_GM.sf2",
+# you uploaded this to GitHub releases
+DEFAULT_SF_URL = (
+    "https://github.com/jossy450/vocal-accompaniment-ai/"
+    "releases/download/soundfont-v1/FluidR3_GM.sf2"
 )
+SOUNDFONT_URL = os.environ.get("SOUNDFONT_URL", DEFAULT_SF_URL)
 
-# Make pydub see ffmpeg (Docker installs it)
+# let pydub find ffmpeg (Dockerfile installs ffmpeg)
 AudioSegment.converter = which("ffmpeg") or "/usr/bin/ffmpeg"
 
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
 app = FastAPI(title="Vocal Accompaniment Generator", version="0.6")
 
 if os.path.isdir(STATIC_DIR):
@@ -47,9 +52,10 @@ if os.path.isdir(STATIC_DIR):
 
 
 # =========================================================
-# SOUND FONT DOWNLOAD (non-fatal)
+# SOUND FONT DOWNLOAD (SAFE)
 # =========================================================
 def ensure_soundfont_safe() -> None:
+    """Download SF2 if missing, but never crash the app."""
     if os.path.exists(SOUNDFONT_PATH):
         return
     print("[soundfont] Not found, downloading from:", SOUNDFONT_URL)
@@ -125,14 +131,14 @@ STYLE_SETTINGS = {
 # =========================================================
 # DSP / ANALYSIS
 # =========================================================
-A4 = 440.0
-
-
 def detect_voice(audio: np.ndarray, sr: int) -> bool:
     if audio.size == 0:
         return False
     energy = np.sqrt(np.mean(audio ** 2))
     return energy > 0.01
+
+
+A4 = 440.0
 
 
 def estimate_key_freq(audio: np.ndarray, sr: int) -> float:
@@ -173,10 +179,10 @@ def estimate_tempo(audio: np.ndarray, sr: int) -> float:
 
 
 # =========================================================
-# LOAD AUDIO (wav/m4a/mp3)
+# AUDIO LOADER
 # =========================================================
 def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
-    # fast wav path
+    # try WAV fast path
     try:
         sr, audio = wavfile.read(io.BytesIO(raw))
         if audio.ndim > 1:
@@ -190,7 +196,7 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
     except Exception:
         pass
 
-    # fallback: pydub
+    # fallback to pydub for m4a/mp3
     seg = AudioSegment.from_file(io.BytesIO(raw))
     seg = seg.set_channels(1)
     sr = seg.frame_rate
@@ -199,7 +205,7 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
 
 
 # =========================================================
-# SMALL UTILITIES (mix, quantize)
+# SMALL HELPERS
 # =========================================================
 def quantize_time(t: float, grid: float) -> float:
     return round(t / grid) * grid
@@ -221,36 +227,175 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
     return y
 
 
-def align_to_vocal(
-    vocal: np.ndarray, band: np.ndarray, sr: int, target_bpm: float, band_bpm: float | None = None
-) -> np.ndarray:
-    """time-stretch band to match vocal tempo"""
-    if not band_bpm or band_bpm <= 0:
-        return band
-    rate = target_bpm / band_bpm
-    band_float = band.astype(np.float32)
-    stretched = librosa.effects.time_stretch(band_float, rate)
-    min_len = min(len(vocal), len(stretched))
-    return stretched[:min_len]
+# =========================================================
+# MASTERING (remote → local fallback)
+# =========================================================
+def call_mastering_api(audio_bytes: bytes) -> bytes:
+    """
+    Try Auphonic (if configured), otherwise do basic in-app mastering.
+    """
+    master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
+    master_url = os.environ.get("MASTERING_URL")
+    master_token = os.environ.get("MASTERING_TOKEN")
+
+    # ----- remote first -----
+    if master_enabled and master_url and master_token:
+        try:
+            files = {"audio_file": ("mix.wav", audio_bytes, "audio/wav")}
+            data = {"token": master_token, "output_files[]": "wav"}
+            r = requests.post(master_url, data=data, files=files, timeout=180)
+            if r.status_code == 200 and len(r.content) > 1000:
+                print("[mastering] remote OK")
+                return r.content
+            else:
+                print("[mastering] remote failed:", r.status_code, r.text[:200])
+        except Exception as e:
+            print("[mastering] remote error:", e)
+
+    # ----- local fallback -----
+    try:
+        mix, sr = sf.read(io.BytesIO(audio_bytes))
+        if mix.ndim > 1:
+            mix = mix.mean(axis=1)
+
+        # normalize
+        peak = np.max(np.abs(mix)) + 1e-9
+        mix = mix / peak * 0.98
+
+        # light RMS gain
+        cur_rms = np.sqrt(np.mean(mix ** 2)) + 1e-9
+        target_rms = 0.08
+        gain = min(target_rms / cur_rms, 1.5)
+        mix = mix * gain
+
+        # HPF
+        mix = simple_highpass(mix, sr, cutoff=130.0)
+
+        mix = np.clip(mix, -1.0, 1.0)
+        buf = io.BytesIO()
+        sf.write(buf, mix, sr, format="WAV")
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        print("[mastering] local error:", e)
+        return audio_bytes
 
 
 # =========================================================
-# MIDI / HARMONY
+# REPLICATE (MusicGen) CALL
+# =========================================================
+REPLICATE_MODEL_VERSION = os.environ.get(
+    "REPLICATE_MODEL_VERSION",
+    "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
+)
+
+
+def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
+    base = (
+        "slow Nigerian gospel / worship backing track, warm piano, soft drums, "
+        "subtle bass, ambient pads, no vocals, tight timing, mixed"
+    )
+    parts = [base]
+    if bpm:
+        parts.append(f"{int(bpm)} BPM")
+    if key_name:
+        parts.append(f"in key of {key_name}")
+    return ", ".join(parts)
+
+
+def call_replicate_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
+    """
+    Generate music with Replicate meta/musicgen (melody).
+    This version uploads the file first, THEN starts prediction.
+    """
+    api_token = os.environ.get("REPLICATE_API_TOKEN")
+    if not api_token:
+        print("[replicate] token not set → skipping")
+        return None
+
+    # 1) upload the vocal as a file
+    try:
+        file_resp = requests.post(
+            "https://api.replicate.com/v1/files",
+            headers={"Authorization": f"Token {api_token}"},
+            files={"file": ("vocal.wav", vocal_bytes, "audio/wav")},
+            timeout=60,
+        )
+        if file_resp.status_code != 200:
+            print("[replicate] file upload failed:", file_resp.status_code, file_resp.text[:200])
+            return None
+
+        file_url = file_resp.json()["urls"]["get"]
+    except Exception as e:
+        print("[replicate] upload error:", e)
+        return None
+
+    # 2) create prediction
+    try:
+        pred_resp = requests.post(
+            "https://api.replicate.com/v1/predictions",
+            headers={
+                "Authorization": f"Token {api_token}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(
+                {
+                    "version": REPLICATE_MODEL_VERSION,
+                    "input": {
+                        "model_version": "stereo-melody-large",
+                        "prompt": prompt,
+                        "input_audio": file_url,
+                        "duration": duration,
+                        "continuation": False,
+                        "output_format": "wav",
+                    },
+                }
+            ),
+            timeout=60,
+        )
+        if pred_resp.status_code not in (200, 201):
+            print("[replicate] create failed:", pred_resp.status_code, pred_resp.text[:200])
+            return None
+
+        prediction = pred_resp.json()
+        pred_id = prediction["id"]
+        status = prediction["status"]
+        poll_url = f"https://api.replicate.com/v1/predictions/{pred_id}"
+
+        while status not in ("succeeded", "failed", "canceled"):
+            poll = requests.get(poll_url, headers={"Authorization": f"Token {api_token}"}, timeout=60)
+            prediction = poll.json()
+            status = prediction["status"]
+
+        if status != "succeeded":
+            print("[replicate] prediction failed:", prediction)
+            return None
+
+        output = prediction.get("output")
+        if isinstance(output, list):
+            audio_url = output[0]
+        else:
+            audio_url = output
+
+        audio_resp = requests.get(audio_url, timeout=120)
+        if audio_resp.status_code == 200:
+            return audio_resp.content
+        return None
+
+    except Exception as e:
+        print("[replicate] ERROR:", e)
+        return None
+
+
+# =========================================================
+# MIDI FALLBACK (same as before, but tidy)
 # =========================================================
 def midi_note_from_freq(freq: float) -> int:
     return int(69 + 12 * np.log2(freq / 440.0))
 
 
 def degree_to_midi(root_midi: int, deg: str) -> int:
-    mapping = {
-        "i": 0,
-        "ii": 2,
-        "iii": 4,
-        "iv": 5,
-        "v": 7,
-        "vi": 9,
-        "vii": 11,
-    }
+    mapping = {"i": 0, "ii": 2, "iii": 4, "iv": 5, "v": 7, "vi": 9, "vii": 11}
     return root_midi + mapping.get(deg, 0)
 
 
@@ -266,100 +411,9 @@ def pick_progression(style: str) -> list[str]:
 
 def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
     degrees = pick_progression(style)
-    out = []
-    for i in range(bars):
-        deg = degrees[i % len(degrees)]
-        out.append(degree_to_midi(root_midi, deg))
-    return out
+    return [degree_to_midi(root_midi, degrees[i % len(degrees)]) for i in range(bars)]
 
 
-# =========================================================
-# MASTERING (optional)
-# =========================================================
-def call_mastering_api(audio_bytes: bytes) -> bytes | None:
-    """
-    Master the audio using Auphonic if configured.
-    If unavailable or fails, apply local mastering fallback.
-
-    Environment variables:
-      MASTERING_ENABLED=true
-      MASTERING_URL=https://auphonic.com/api/simple/productions.json
-      MASTERING_TOKEN=<your_auphonic_token>
-    """
-    master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
-    master_url = os.environ.get("MASTERING_URL")
-    master_token = os.environ.get("MASTERING_TOKEN")
-
-    # =============== TRY AUPHONIC API ===============
-    if master_enabled and master_url and master_token:
-        try:
-            files = {"audio_file": ("mix.wav", audio_bytes, "audio/wav")}
-            data = {
-                "token": master_token,
-                "output_files[]": "wav",
-            }
-
-            resp = requests.post(master_url, data=data, files=files, timeout=180)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                print("[mastering] Auphonic mastering successful.")
-                return resp.content
-            else:
-                print(f"[mastering] Auphonic failed ({resp.status_code}). Falling back.")
-        except Exception as e:
-            print("[mastering] ERROR calling Auphonic:", e)
-
-    # =============== LOCAL MASTERING FALLBACK ===============
-    print("[mastering] Using local mastering fallback...")
-
-    try:
-        # Convert bytes to numpy
-        import soundfile as sf
-        import io
-        import numpy as np
-
-        mix, sr = sf.read(io.BytesIO(audio_bytes))
-        if mix.ndim > 1:
-            mix = mix.mean(axis=1)
-
-        # Normalize to -1 dBFS
-        peak = np.max(np.abs(mix)) + 1e-9
-        mix = mix / peak * 0.98
-
-        # Simple RMS compressor
-        rms_val = np.sqrt(np.mean(mix ** 2)) + 1e-9
-        target_rms = 0.08
-        gain = target_rms / rms_val
-        gain = min(gain, 1.5)
-        mix = mix * gain
-
-        # Gentle high-pass to remove mud
-        cutoff = 150.0
-        rc = np.exp(-2 * np.pi * cutoff / sr)
-        y = np.zeros_like(mix)
-        prev_x, prev_y = 0.0, 0.0
-        for i, x in enumerate(mix):
-            y[i] = x - prev_x + rc * prev_y
-            prev_x = x
-            prev_y = y[i]
-        mix = y
-
-        # Re-limit to prevent clipping
-        mix = np.clip(mix, -1.0, 1.0)
-
-        buf = io.BytesIO()
-        sf.write(buf, mix, sr, format="WAV")
-        buf.seek(0)
-        print("[mastering] Local mastering complete.")
-        return buf.getvalue()
-
-    except Exception as e:
-        print("[mastering] ERROR in local fallback:", e)
-        return audio_bytes
-
-
-# =========================================================
-# MIDI RENDERER (fallback)
-# =========================================================
 def render_midi_band(
     sr: int,
     duration: float,
@@ -374,14 +428,14 @@ def render_midi_band(
     if not os.path.exists(SOUNDFONT_PATH):
         ensure_soundfont_safe()
     if not os.path.exists(SOUNDFONT_PATH):
-        raise ValueError(f"SoundFont not found at {SOUNDFONT_PATH}")
+        raise ValueError("SoundFont still missing after download attempt")
 
     root_midi = midi_note_from_freq(root_freq)
     bar_seconds = 60.0 / bpm * 4
     bars = int(np.ceil(duration / bar_seconds)) + 1
     progression = build_chord_progression(root_midi, style, bars)
-    sixteenth = bar_seconds / 16.0
 
+    sixteenth = bar_seconds / 16.0
     pm = pretty_midi.PrettyMIDI()
 
     # piano
@@ -392,14 +446,7 @@ def render_midi_band(
             start = quantize_time(t, sixteenth)
             end = quantize_time(t + bar_seconds * 0.95, sixteenth)
             for n in [chord_root, chord_root + 4, chord_root + 7]:
-                piano.notes.append(
-                    pretty_midi.Note(
-                        velocity=85,
-                        pitch=n,
-                        start=start,
-                        end=end,
-                    )
-                )
+                piano.notes.append(pretty_midi.Note(velocity=85, pitch=n, start=start, end=end))
             t += bar_seconds
             if t > duration:
                 break
@@ -413,12 +460,7 @@ def render_midi_band(
             start = quantize_time(t, sixteenth)
             end = quantize_time(t + bar_seconds * 0.9, sixteenth)
             bass.notes.append(
-                pretty_midi.Note(
-                    velocity=100,
-                    pitch=chord_root - 12,
-                    start=start,
-                    end=end,
-                )
+                pretty_midi.Note(velocity=100, pitch=chord_root - 12, start=start, end=end)
             )
             t += bar_seconds
             if t > duration:
@@ -435,104 +477,32 @@ def render_midi_band(
         while t < duration:
             if pattern == "afro-groove":
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=110,
-                        pitch=36,
-                        start=quantize_time(t, sixteenth),
-                        end=quantize_time(t + 0.1, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=110, pitch=36, start=quantize_time(t, sixteenth), end=quantize_time(t + 0.1, sixteenth))
                 )
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=70,
-                        pitch=60,
-                        start=quantize_time(t + half, sixteenth),
-                        end=quantize_time(t + half + 0.08, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=70, pitch=60, start=quantize_time(t + half, sixteenth), end=quantize_time(t + half + 0.08, sixteenth))
                 )
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=105,
-                        pitch=38,
-                        start=quantize_time(t + beat, sixteenth),
-                        end=quantize_time(t + beat + 0.1, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=105, pitch=38, start=quantize_time(t + beat, sixteenth), end=quantize_time(t + beat + 0.1, sixteenth))
                 )
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=65,
-                        pitch=60,
-                        start=quantize_time(t + beat + half, sixteenth),
-                        end=quantize_time(t + beat + half + 0.08, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=65, pitch=60, start=quantize_time(t + beat + half, sixteenth), end=quantize_time(t + beat + half + 0.08, sixteenth))
                 )
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=90,
-                        pitch=36,
-                        start=quantize_time(t + 2 * beat, sixteenth),
-                        end=quantize_time(t + 2 * beat + 0.08, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=90, pitch=36, start=quantize_time(t + 2 * beat, sixteenth), end=quantize_time(t + 2 * beat + 0.08, sixteenth))
                 )
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=110,
-                        pitch=39,
-                        start=quantize_time(t + 3 * beat, sixteenth),
-                        end=quantize_time(t + 3 * beat + 0.1, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=110, pitch=39, start=quantize_time(t + 3 * beat, sixteenth), end=quantize_time(t + 3 * beat + 0.1, sixteenth))
                 )
                 t += 4 * beat
-
-            elif pattern == "one-drop":
-                drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=95,
-                        pitch=36,
-                        start=quantize_time(t + beat, sixteenth),
-                        end=quantize_time(t + beat + 0.1, sixteenth),
-                    )
-                )
-                drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=105,
-                        pitch=38,
-                        start=quantize_time(t + beat, sixteenth),
-                        end=quantize_time(t + beat + 0.1, sixteenth),
-                    )
-                )
-                t += 2 * beat
-
-            elif pattern == "four-on-floor":
-                drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=100,
-                        pitch=36,
-                        start=quantize_time(t, sixteenth),
-                        end=quantize_time(t + 0.1, sixteenth),
-                    )
-                )
-                t += beat
-
             else:
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=110,
-                        pitch=36,
-                        start=quantize_time(t, sixteenth),
-                        end=quantize_time(t + 0.1, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=110, pitch=36, start=quantize_time(t, sixteenth), end=quantize_time(t + 0.1, sixteenth))
                 )
                 drum.notes.append(
-                    pretty_midi.Note(
-                        velocity=110,
-                        pitch=38,
-                        start=quantize_time(t + beat, sixteenth),
-                        end=quantize_time(t + beat + 0.1, sixteenth),
-                    )
+                    pretty_midi.Note(velocity=110, pitch=38, start=quantize_time(t + beat, sixteenth), end=quantize_time(t + beat + 0.1, sixteenth))
                 )
                 t += 2 * beat
-
         pm.instruments.append(drum)
 
     # guitar skank
@@ -548,16 +518,13 @@ def render_midi_band(
                 if q_off < duration:
                     guitar.notes.append(
                         pretty_midi.Note(
-                            velocity=80,
-                            pitch=root_midi + 7,
-                            start=q_off,
-                            end=q_off + 0.12,
+                            velocity=80, pitch=root_midi + 7, start=q_off, end=q_off + 0.12
                         )
                     )
             tbar += bar_seconds
         pm.instruments.append(guitar)
 
-    # render with fluidsynth
+    # render
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpwav:
         tmp_path = tmpwav.name
 
@@ -572,114 +539,14 @@ def render_midi_band(
 
 
 # =========================================================
-# REPLICATE: meta/musicgen (melody)
-# =========================================================
-REPLICATE_MODEL_VERSION = os.environ.get(
-    "REPLICATE_MODEL_VERSION",
-    "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
-)
-
-def build_gospel_prompt(bpm: float, key: str | None) -> str:
-    base = (
-        "slow Nigerian gospel / worship backing track, warm piano, soft drums, "
-        "subtle bass, ambient pads, no lead vocals, mixed and spatial, "
-        "tight timing, congregational feel"
-    )
-    parts = [base]
-    if bpm:
-        parts.append(f"{int(bpm)} BPM")
-    if key:
-        parts.append(f"in key of {key}")
-    return ", ".join(parts)
-
-
-def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
-    api_token = os.environ.get("REPLICATE_API_TOKEN")
-    if not api_token:
-        print("[replicate] REPLICATE_API_TOKEN not set")
-        return None
-
-    pred_url = "https://api.replicate.com/v1/predictions"
-    headers = {
-        "Authorization": f"Token {api_token}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        # 1) upload the vocal file
-        file_resp = requests.post(
-            "https://api.replicate.com/v1/files",
-            headers={"Authorization": f"Token {api_token}"},
-            files={"file": ("vocal.wav", vocal_bytes, "audio/wav")},
-            timeout=60,
-        )
-        if file_resp.status_code != 200:
-            print("[replicate] file upload failed:", file_resp.status_code, file_resp.text)
-            return None
-
-        file_data = file_resp.json()
-        file_url = file_data["urls"]["get"]
-
-        payload = {
-            "version": REPLICATE_MODEL_VERSION,
-            "input": {
-                "model_version": "stereo-melody-large",
-                "prompt": prompt,
-                "input_audio": file_url,
-                "duration": duration,
-                "continuation": False,
-                "output_format": "wav",
-            },
-        }
-
-        # 2) create prediction
-        pred_resp = requests.post(pred_url, headers=headers, data=json.dumps(payload), timeout=60)
-        if pred_resp.status_code not in (200, 201):
-            print("[replicate] prediction create failed:", pred_resp.status_code, pred_resp.text)
-            return None
-
-        prediction = pred_resp.json()
-        pred_id = prediction["id"]
-
-        # 3) poll
-        status = prediction["status"]
-        get_url = f"{pred_url}/{pred_id}"
-        while status not in ("succeeded", "failed", "canceled"):
-            poll = requests.get(get_url, headers=headers, timeout=60)
-            prediction = poll.json()
-            status = prediction["status"]
-
-        if status != "succeeded":
-            print("[replicate] prediction failed:", prediction)
-            return None
-
-        output_urls = prediction.get("output")
-        if not output_urls:
-            return None
-        if isinstance(output_urls, list):
-            audio_url = output_urls[0]
-        else:
-            audio_url = output_urls
-
-        audio_resp = requests.get(audio_url, timeout=120)
-        if audio_resp.status_code == 200:
-            return audio_resp.content
-
-    except Exception as e:
-        print("[replicate] ERROR:", e)
-
-    return None
-
-
-# =========================================================
 # ROUTES
 # =========================================================
 @app.get("/")
 async def root_ui():
-    idx = os.path.join(STATIC_DIR, "index.html")
-    if os.path.exists(idx):
-        return FileResponse(idx)
-    return {"detail": "Vocal Accompaniment API running"}
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"detail": "UI not found, but API is running."}
 
 
 @app.post("/generate")
@@ -695,57 +562,48 @@ async def generate(
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # ---- load vocal and analyze ----
     vocal, sr = load_audio_from_bytes(raw)
+
+    # analyse vocal
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
 
-    # ---- try remote Replicate first ----
+    # 1) try Replicate (the sophisticated way)
     gospel_prompt = build_gospel_prompt(bpm, key_name)
-    remote_band_bytes = call_replicate_musicgen_gospel(
-        vocal_bytes=raw,
-        prompt=gospel_prompt,
-        duration=int(len(vocal) / sr) if len(vocal) / sr < 30 else 30,
-    )
+    remote_duration = min(int(len(vocal) / sr) + 2, 30)
+    remote_bytes = call_replicate_musicgen(raw, gospel_prompt, duration=remote_duration)
 
-    if remote_band_bytes is not None:
-        band, band_sr = load_audio_from_bytes(remote_band_bytes)
-
-        # align / resample
+    if remote_bytes is not None:
+        # align to vocal length
+        band, band_sr = load_audio_from_bytes(remote_bytes)
         if band_sr != sr:
             band = librosa.resample(band, orig_sr=band_sr, target_sr=sr)
-            band_sr = sr
 
-        aligned_band = align_to_vocal(vocal, band, sr, target_bpm=bpm, band_bpm=bpm)
+        # simple align (same BPM for now)
+        min_len = min(len(vocal), len(band))
+        vocal = vocal[:min_len]
+        band = band[:min_len]
 
-        # gospel mix: vocal on top
-        aligned_band = simple_highpass(aligned_band, sr, cutoff=130.0)
+        band = simple_highpass(band, sr, cutoff=130.0)
         v_r = rms(vocal)
-        b_r = rms(aligned_band)
+        b_r = rms(band)
         if b_r > 0:
-            aligned_band = aligned_band * (v_r / (b_r * 1.4))
+            band = band * (v_r / (b_r * 1.4))
 
-        mix = vocal * 1.0 + aligned_band * 0.7
+        mix = vocal + 0.75 * band
         peak = np.max(np.abs(mix)) + 1e-9
         if peak > 1.0:
             mix = mix / peak
 
-        # to wav
-        buf = io.BytesIO()
-        wavfile.write(buf, sr, (mix * 32767).astype(np.int16))
-        buf.seek(0)
-
-        mastered = call_mastering_api(buf.getvalue())
-        final_bytes = mastered if mastered is not None else buf.getvalue()
-
+        mastered = call_mastering_api(_to_wav_bytes(mix, sr))
         return StreamingResponse(
-            io.BytesIO(final_bytes),
+            io.BytesIO(mastered),
             media_type="audio/wav",
-            headers={"Content-Disposition": 'attachment; filename="gospel_accompaniment.wav"'},
+            headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # ---- FALLBACK: local MIDI band ----
+    # 2) FALLBACK → local MIDI
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
     duration = len(vocal) / sr
@@ -772,17 +630,22 @@ async def generate(
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
-    mix = vocal * 1.0 + band * 0.85
+    mix = vocal + 0.85 * band
     peak = np.max(np.abs(mix)) + 1e-9
     if peak > 1.0:
         mix = mix / peak
 
-    out_buf = io.BytesIO()
-    wavfile.write(out_buf, sr, (mix * 32767).astype(np.int16))
-    out_buf.seek(0)
-
+    mastered = call_mastering_api(_to_wav_bytes(mix, sr))
     return StreamingResponse(
-        out_buf,
+        io.BytesIO(mastered),
         media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename="gospel_accompaniment.wav"'},
+        headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
     )
+
+
+# small helper to turn np audio → wav bytes
+def _to_wav_bytes(audio: np.ndarray, sr: int) -> bytes:
+    buf = io.BytesIO()
+    wavfile.write(buf, sr, (audio * 32767).astype(np.int16))
+    buf.seek(0)
+    return buf.getvalue()
