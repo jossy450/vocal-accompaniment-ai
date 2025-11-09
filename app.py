@@ -272,32 +272,43 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
 
 
 def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
-    """Call your HF Space, log ANY error, but never crash."""
-    url = os.environ.get("HF_MUSICGEN_URL")
-    if not url:
+    """
+    Try the Space under several possible Gradio routes.
+    Log every failure, but never crash.
+    """
+    base = os.environ.get("HF_MUSICGEN_URL", "").rstrip("/")
+    if not base:
         print("[hf-musicgen] HF_MUSICGEN_URL not set")
         return None
 
-    try:
-        payload = {
-            "data": [
-                prompt,
-                duration,
-            ]
-        }
-        resp = requests.post(url, json=payload, timeout=180)
-        if resp.status_code != 200:
-            # 👇 keep the exact message so you can debug
-            print(f"[hf-musicgen] bad status: {resp.status_code} {resp.text[:200]}")
-            return None
+    # most common routes in HF Spaces
+    candidate_paths = [
+        "/run/predict",        # older / simpler gradio
+        "/proxy/run/predict",  # some hosted/proxied spaces
+        "/api/predict/",       # newer gradio style
+    ]
 
-        # Spaces usually return binary audio directly OR a gradio-style dict;
-        # your previous code used load_audio_from_bytes, so we just return resp.content
-        return resp.content
+    payload = {
+        "data": [
+            prompt,
+            duration,
+        ]
+    }
 
-    except Exception as e:
-        print("[hf-musicgen] ERROR calling space:", e)
-        return None
+    for path in candidate_paths:
+        url = f"{base}{path}"
+        try:
+            resp = requests.post(url, json=payload, timeout=180)
+            if resp.status_code == 200:
+                # success – return bytes
+                return resp.content
+            else:
+                print(f"[hf-musicgen] bad status at {url}: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            print(f"[hf-musicgen] ERROR calling {url}: {e}")
+
+    # none of the routes worked → let the caller fall back to MIDI
+    return None
 
 
 # =========================================================
