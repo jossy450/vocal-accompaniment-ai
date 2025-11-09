@@ -657,6 +657,111 @@ def render_midi_band(
 
 
 # =========================================================
+# REPLICATE MODEL VERSION
+# =========================================================
+
+REPLICATE_MODEL_VERSION = os.environ.get(
+    "REPLICATE_MODEL_VERSION",
+    "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",  # meta/musicgen current version
+)
+
+def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
+    """
+    Call Replicate's meta/musicgen (melody) to generate a backing track.
+    Docs: https://replicate.com/meta/musicgen/api
+    """
+    api_token = os.environ.get("REPLICATE_API_TOKEN")
+    if not api_token:
+        print("[replicate] REPLICATE_API_TOKEN not set")
+        return None
+
+    url = f"https://api.replicate.com/v1/predictions"
+
+    # Replicate expects an input with the fields from the model page:
+    # model_version, prompt, input_audio, duration, continuation, etc. :contentReference[oaicite:1]{index=1}
+    payload = {
+        "version": REPLICATE_MODEL_VERSION,
+        "input": {
+            "model_version": "stereo-melody-large",  # default on the page
+            "prompt": prompt,
+            # we must supply the file as a URL or as multipart upload.
+            # For simplicity, we'll upload via files= ... (see below)
+            "duration": duration,
+            "continuation": False,
+            "output_format": "wav",
+            # if you want it to *continue* the vocal instead of just follow melody:
+            # "continuation": True,
+        },
+    }
+
+    headers = {
+        "Authorization": f"Token {api_token}",
+        "Content-Type": "application/json",
+    }
+
+    # 1) create prediction
+    try:
+        # we can't put raw bytes into JSON, so we first upload the audio to Replicate's files endpoint
+        # but Replicate also accepts direct upload via `input_audio` as a URL.
+        # Easiest: upload file to Replicate's /v1/files
+        file_resp = requests.post(
+            "https://api.replicate.com/v1/files",
+            headers={"Authorization": f"Token {api_token}"},
+            files={"file": ("vocal.wav", vocal_bytes, "audio/wav")},
+            timeout=60,
+        )
+        if file_resp.status_code != 200:
+            print("[replicate] file upload failed:", file_resp.status_code, file_resp.text)
+            return None
+
+        file_data = file_resp.json()
+        file_url = file_data["urls"]["get"]
+
+        # now tell the prediction to use that uploaded file
+        payload["input"]["input_audio"] = file_url
+
+        pred_resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        if pred_resp.status_code not in (200, 201):
+            print("[replicate] prediction create failed:", pred_resp.status_code, pred_resp.text)
+            return None
+
+        prediction = pred_resp.json()
+        pred_id = prediction["id"]
+
+        # 2) poll until finished
+        status = prediction["status"]
+        get_url = f"{url}/{pred_id}"
+        while status not in ("succeeded", "failed", "canceled"):
+            poll = requests.get(get_url, headers=headers, timeout=60)
+            prediction = poll.json()
+            status = prediction["status"]
+
+        if status != "succeeded":
+            print("[replicate] prediction failed:", prediction)
+            return None
+
+        # 3) download output
+        # For meta/musicgen, output is a single URL to the WAV. :contentReference[oaicite:2]{index=2}
+        output_urls = prediction.get("output")
+        if not output_urls:
+            return None
+        if isinstance(output_urls, list):
+            audio_url = output_urls[0]
+        else:
+            audio_url = output_urls
+
+        audio_resp = requests.get(audio_url, timeout=120)
+        if audio_resp.status_code == 200:
+            return audio_resp.content
+        return None
+
+    except Exception as e:
+        print("[replicate] ERROR:", e)
+        return None
+
+
+
+# =========================================================
 # ROUTES
 # =========================================================
 
