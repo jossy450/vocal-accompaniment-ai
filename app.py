@@ -229,6 +229,13 @@ def estimate_key_freq(audio: np.ndarray, sr: int) -> float:
     f0 = sr / peak
     return float(np.clip(f0, 80.0, 800.0))
 
+def rough_key_from_freq(freq: float) -> str | None:
+    if not freq:
+        return None
+    # map to nearest MIDI note
+    midi = int(round(69 + 12 * np.log2(freq / 440.0)))
+    scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    return scale[midi % 12]
 
 def estimate_tempo(audio: np.ndarray, sr: int) -> float:
     hop = 1024
