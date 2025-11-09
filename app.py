@@ -324,18 +324,63 @@ def call_mastering_api(audio_bytes: bytes) -> bytes:
         return audio_bytes
 
 
-def call_hf_musicgen_fallback(vocal_bytes, prompt, duration=30):
-    url = "https://api-inference.huggingface.co/models/facebook/musicgen-melody"
-    headers = {"Authorization": f"Bearer {os.getenv('HF_API_TOKEN')}"}
+def call_hf_musicgen_fallback(vocal_bytes: bytes, prompt: str, duration: int = 30):
+    """
+    Call HF via the new router endpoint.
+    You must have HF_API_TOKEN set in Railway.
+
+    Note: the exact model path below ("meta-llama/AudioCraft/musicgen-melody" etc.)
+    might need to be adjusted to whatever model you actually have access to.
+    """
+    hf_token = os.getenv("HF_API_TOKEN")
+    if not hf_token:
+        print("[hf-fallback] HF_API_TOKEN not set, skipping.")
+        return None
+
+    # new recommended endpoint from the error in your logs
+    url = "https://router.huggingface.co/inference"
+
+    # tell the router which task/model we want
     payload = {
+        "model": "facebook/musicgen-melody",   # adjust if you use a different one
         "inputs": prompt,
-        "parameters": {"duration": duration}
+        "parameters": {
+            "duration": duration
+        }
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
-    if resp.status_code == 200:
-        return io.BytesIO(resp.content)
-    else:
-        print("HF API Error:", resp.text)
+
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        if resp.status_code != 200:
+            print(f"[hf-fallback] router returned {resp.status_code}: {resp.text[:200]}")
+            return None
+
+        # sometimes HF returns binary audio, sometimes JSON with a URL/reference.
+        # we'll handle the simplest case: raw audio bytes
+        content_type = resp.headers.get("content-type", "")
+        if "audio" in content_type:
+            return io.BytesIO(resp.content)
+
+        # otherwise try to parse JSON
+        data = resp.json()
+        # if it's a URL we can download it
+        if isinstance(data, dict):
+            maybe_url = data.get("audio") or data.get("url")
+            if isinstance(maybe_url, str) and maybe_url.startswith("http"):
+                audio_resp = requests.get(maybe_url, timeout=120)
+                if audio_resp.status_code == 200:
+                    return io.BytesIO(audio_resp.content)
+
+        print("[hf-fallback] unrecognized HF router response shape:", data)
+        return None
+
+    except Exception as e:
+        print("[hf-fallback] error calling HF router:", e)
         return None
 
 # =========================================================
