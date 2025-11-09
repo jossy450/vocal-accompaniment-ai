@@ -306,64 +306,73 @@ def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
 def call_replicate_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
     """
     Generate music with Replicate meta/musicgen (melody).
-    This version uploads the file first, THEN starts prediction.
+    Updated 2025-compatible upload flow.
     """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     if not api_token:
-        print("[replicate] token not set → skipping")
+        print("[replicate] REPLICATE_API_TOKEN not set")
         return None
 
-    # 1) upload the vocal as a file
+    headers = {"Authorization": f"Token {api_token}"}
+
     try:
-        file_resp = requests.post(
+        # STEP 1 — Request a presigned upload URL
+        presign_resp = requests.post(
             "https://api.replicate.com/v1/files",
-            headers={"Authorization": f"Token {api_token}"},
-            files={"file": ("vocal.wav", vocal_bytes, "audio/wav")},
+            headers=headers,
+            json={"filename": "vocal.wav"},
             timeout=60,
         )
-        if file_resp.status_code != 200:
-            print("[replicate] file upload failed:", file_resp.status_code, file_resp.text[:200])
+        if presign_resp.status_code != 200:
+            print("[replicate] presign failed:", presign_resp.status_code, presign_resp.text[:200])
             return None
 
-        file_url = file_resp.json()["urls"]["get"]
-    except Exception as e:
-        print("[replicate] upload error:", e)
-        return None
+        presigned = presign_resp.json()
+        upload_url = presigned["upload_url"]
+        get_url = presigned["urls"]["get"]
 
-    # 2) create prediction
-    try:
+        # STEP 2 — Upload actual file bytes to the presigned URL (PUT)
+        upload_resp = requests.put(
+            upload_url,
+            data=vocal_bytes,
+            headers={"Content-Type": "audio/wav"},
+            timeout=60,
+        )
+        if upload_resp.status_code not in (200, 201):
+            print("[replicate] file PUT failed:", upload_resp.status_code, upload_resp.text[:200])
+            return None
+
+        # STEP 3 — Start the MusicGen prediction
+        payload = {
+            "version": REPLICATE_MODEL_VERSION,
+            "input": {
+                "model_version": "stereo-melody-large",
+                "prompt": prompt,
+                "input_audio": get_url,
+                "duration": duration,
+                "continuation": False,
+                "output_format": "wav",
+            },
+        }
+
         pred_resp = requests.post(
             "https://api.replicate.com/v1/predictions",
-            headers={
-                "Authorization": f"Token {api_token}",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(
-                {
-                    "version": REPLICATE_MODEL_VERSION,
-                    "input": {
-                        "model_version": "stereo-melody-large",
-                        "prompt": prompt,
-                        "input_audio": file_url,
-                        "duration": duration,
-                        "continuation": False,
-                        "output_format": "wav",
-                    },
-                }
-            ),
+            headers={**headers, "Content-Type": "application/json"},
+            data=json.dumps(payload),
             timeout=60,
         )
         if pred_resp.status_code not in (200, 201):
-            print("[replicate] create failed:", pred_resp.status_code, pred_resp.text[:200])
+            print("[replicate] prediction create failed:", pred_resp.status_code, pred_resp.text[:200])
             return None
 
         prediction = pred_resp.json()
         pred_id = prediction["id"]
-        status = prediction["status"]
         poll_url = f"https://api.replicate.com/v1/predictions/{pred_id}"
 
+        # STEP 4 — Poll until finished
+        status = prediction["status"]
         while status not in ("succeeded", "failed", "canceled"):
-            poll = requests.get(poll_url, headers={"Authorization": f"Token {api_token}"}, timeout=60)
+            poll = requests.get(poll_url, headers=headers, timeout=60)
             prediction = poll.json()
             status = prediction["status"]
 
@@ -372,19 +381,21 @@ def call_replicate_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30)
             return None
 
         output = prediction.get("output")
-        if isinstance(output, list):
-            audio_url = output[0]
-        else:
-            audio_url = output
+        audio_url = output[0] if isinstance(output, list) else output
 
+        # STEP 5 — Download generated music
         audio_resp = requests.get(audio_url, timeout=120)
         if audio_resp.status_code == 200:
+            print("[replicate] generation complete ✓")
             return audio_resp.content
+
+        print("[replicate] audio fetch failed:", audio_resp.status_code)
         return None
 
     except Exception as e:
         print("[replicate] ERROR:", e)
         return None
+
 
 
 # =========================================================
