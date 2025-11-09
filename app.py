@@ -2,10 +2,11 @@ import os
 import io
 import tempfile
 import random
-import numpy as np
-import requests
 import json
 import base64
+
+import numpy as np
+import requests
 import librosa
 
 from fastapi import FastAPI, HTTPException, Request, Query
@@ -21,130 +22,34 @@ from pydub.utils import which
 
 
 # =========================================================
-# ALIGN TO VOCAL
-# =========================================================
-
-def align_to_vocal(vocal: np.ndarray, band: np.ndarray, sr: int, target_bpm: float, band_bpm: float | None = None) -> np.ndarray:
-    """
-    Stretch the band to match vocal tempo.
-    If band_bpm is unknown, we just return band.
-    """
-    if not band_bpm or band_bpm <= 0:
-        return band
-
-    rate = target_bpm / band_bpm
-    # librosa.effects.time_stretch wants float32
-    band_float = band.astype(np.float32)
-    stretched = librosa.effects.time_stretch(band_float, rate)
-    # make length match vocal
-    min_len = min(len(vocal), len(stretched))
-    return stretched[:min_len]
-    
-# =========================================================
-# REMOTE MUSIC MODEL
-# =========================================================
-
-def build_gospel_prompt(bpm: float, key: str | None) -> str:
-    base = (
-        "slow Nigerian gospel / worship backing track, warm piano, soft drums, "
-        "subtle bass, ambient pads, no lead vocals, mixed and spatial, "
-        "tight timing, congregational feel"
-    )
-    parts = [base]
-    if bpm:
-        parts.append(f"{int(bpm)} BPM")
-    if key:
-        parts.append(f"in key of {key}")
-    return ", ".join(parts)
-
-# =========================================================
-# REMOTE MUSIC MODEL
-# =========================================================
-def call_remote_gospel_model(vocal_bytes: bytes, bpm: float, key: str | None) -> bytes | None:
-    """
-    Calls a remote music generator (e.g. Replicate/HF) with a gospel/worship prompt.
-    """
-    remote_url = os.environ.get("REMOTE_MUSIC_URL")
-    remote_token = os.environ.get("REMOTE_MUSIC_TOKEN")
-    if not remote_url or not remote_token:
-        return None
-
-    vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
-    prompt = build_gospel_prompt(bpm, key)
-
-    payload = {
-        # adjust these keys to match the model you actually pick
-        "version": "gospel-musicgen-v1",
-        "input": {
-            "prompt": prompt,
-            "audio": vocal_b64,         # some models call this “melody” or “input_audio”
-            "duration": 35,             # worship is usually longer; shorten if model limits
-        },
-    }
-
-    try:
-        resp = requests.post(
-            remote_url,
-            headers={
-                "Authorization": f"Token {remote_token}",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(payload),
-            timeout=180,
-        )
-        if resp.status_code not in (200, 201):
-            print("[remote-gospel] bad status:", resp.status_code, resp.text)
-            return None
-
-        data = resp.json()
-
-        # common pattern: output is a URL
-        if isinstance(data.get("output"), str):
-            audio_resp = requests.get(data["output"], timeout=180)
-            if audio_resp.status_code == 200:
-                return audio_resp.content
-
-        # or base64
-        if "audio_b64" in data:
-            return base64.b64decode(data["audio_b64"])
-
-    except Exception as e:
-        print("[remote-gospel] ERROR:", e)
-
-    return None
-
-
-# =========================================================
-# PATHS & GLOBALS
+# PATHS & APP
 # =========================================================
 BASE_DIR = os.path.dirname(__file__)
-
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 SOUNDFONT_DIR = os.path.join(BASE_DIR, "soundfonts")
 os.makedirs(SOUNDFONT_DIR, exist_ok=True)
 SOUNDFONT_PATH = os.path.join(SOUNDFONT_DIR, "FluidR3_GM.sf2")
 
-# your GitHub release URL (overridable in Railway)
+# GitHub-hosted soundfont (can be overridden in Railway)
 SOUNDFONT_URL = os.environ.get(
     "SOUNDFONT_URL",
     "https://github.com/jossy450/vocal-accompaniment-ai/releases/download/soundfont-v1/FluidR3_GM.sf2",
 )
 
-# let pydub find ffmpeg
+# Make pydub see ffmpeg (Docker installs it)
 AudioSegment.converter = which("ffmpeg") or "/usr/bin/ffmpeg"
 
-app = FastAPI(title="Vocal Accompaniment Generator", version="0.5")
+app = FastAPI(title="Vocal Accompaniment Generator", version="0.6")
 
 if os.path.isdir(STATIC_DIR):
     app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
 
 # =========================================================
-# SOUNDFONT HANDLING
+# SOUND FONT DOWNLOAD (non-fatal)
 # =========================================================
 def ensure_soundfont_safe() -> None:
-    """Download SF2 if missing, but don't crash if it fails."""
     if os.path.exists(SOUNDFONT_PATH):
         return
     print("[soundfont] Not found, downloading from:", SOUNDFONT_URL)
@@ -162,7 +67,6 @@ def ensure_soundfont_safe() -> None:
         print("[soundfont] ERROR:", e)
 
 
-# do it once on startup
 ensure_soundfont_safe()
 
 
@@ -219,8 +123,11 @@ STYLE_SETTINGS = {
 
 
 # =========================================================
-# ANALYSIS / DSP HELPERS
+# DSP / ANALYSIS
 # =========================================================
+A4 = 440.0
+
+
 def detect_voice(audio: np.ndarray, sr: int) -> bool:
     if audio.size == 0:
         return False
@@ -228,39 +135,37 @@ def detect_voice(audio: np.ndarray, sr: int) -> bool:
     return energy > 0.01
 
 
-A4 = 440.0
-
-
 def estimate_key_freq(audio: np.ndarray, sr: int) -> float:
     if audio.size < sr // 2:
         return A4
     segment = audio[:sr] if audio.size >= sr else audio
     segment = segment - np.mean(segment)
-    corr = np.correlate(segment, segment, mode="full")[len(segment) - 1:]
-    corr[0:int(sr / 1000)] = 0
+    corr = np.correlate(segment, segment, mode="full")[len(segment) - 1 :]
+    corr[0 : int(sr / 1000)] = 0
     peak = np.argmax(corr)
     if peak <= 0:
         return A4
     f0 = sr / peak
     return float(np.clip(f0, 80.0, 800.0))
 
+
 def rough_key_from_freq(freq: float) -> str | None:
     if not freq:
         return None
-    # map to nearest MIDI note
     midi = int(round(69 + 12 * np.log2(freq / 440.0)))
     scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     return scale[midi % 12]
+
 
 def estimate_tempo(audio: np.ndarray, sr: int) -> float:
     hop = 1024
     frames = max(1, (len(audio) - hop) // hop)
     if frames < 4:
         return 100.0
-    env = [np.sum(audio[i * hop:(i + 1) * hop] ** 2) for i in range(frames)]
+    env = [np.sum(audio[i * hop : (i + 1) * hop] ** 2) for i in range(frames)]
     env = np.array(env)
     env = (env - env.mean()) / (env.std() + 1e-8)
-    corr = np.correlate(env, env, mode="full")[len(env) - 1:]
+    corr = np.correlate(env, env, mode="full")[len(env) - 1 :]
     corr[:2] = 0
     lag = np.argmax(corr[2:400]) + 2
     bpm = 60.0 * sr / (lag * hop)
@@ -268,9 +173,10 @@ def estimate_tempo(audio: np.ndarray, sr: int) -> float:
 
 
 # =========================================================
-# AUDIO LOADER
+# LOAD AUDIO (wav/m4a/mp3)
 # =========================================================
 def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
+    # fast wav path
     try:
         sr, audio = wavfile.read(io.BytesIO(raw))
         if audio.ndim > 1:
@@ -284,11 +190,48 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
     except Exception:
         pass
 
+    # fallback: pydub
     seg = AudioSegment.from_file(io.BytesIO(raw))
     seg = seg.set_channels(1)
     sr = seg.frame_rate
     audio = np.array(seg.get_array_of_samples()).astype(np.float32) / 32768.0
     return audio, sr
+
+
+# =========================================================
+# SMALL UTILITIES (mix, quantize)
+# =========================================================
+def quantize_time(t: float, grid: float) -> float:
+    return round(t / grid) * grid
+
+
+def rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(x ** 2)) + 1e-9)
+
+
+def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.ndarray:
+    rc = np.exp(-2 * np.pi * cutoff / sr)
+    y = np.zeros_like(accomp)
+    prev_x = 0.0
+    prev_y = 0.0
+    for i, x in enumerate(accomp):
+        y[i] = x - prev_x + rc * prev_y
+        prev_x = x
+        prev_y = y[i]
+    return y
+
+
+def align_to_vocal(
+    vocal: np.ndarray, band: np.ndarray, sr: int, target_bpm: float, band_bpm: float | None = None
+) -> np.ndarray:
+    """time-stretch band to match vocal tempo"""
+    if not band_bpm or band_bpm <= 0:
+        return band
+    rate = target_bpm / band_bpm
+    band_float = band.astype(np.float32)
+    stretched = librosa.effects.time_stretch(band_float, rate)
+    min_len = min(len(vocal), len(stretched))
+    return stretched[:min_len]
 
 
 # =========================================================
@@ -331,98 +274,15 @@ def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
 
 
 # =========================================================
-# QUANTIZATION + SIMPLE MIX HELPERS
+# MASTERING (optional)
 # =========================================================
-def quantize_time(t: float, grid: float) -> float:
-    return round(t / grid) * grid
-
-
-def rms(x: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(x ** 2)) + 1e-9)
-
-
-def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.ndarray:
-    """very cheap HPF to reduce mud from band."""
-    rc = np.exp(-2 * np.pi * cutoff / sr)
-    y = np.zeros_like(accomp)
-    prev_x = 0.0
-    prev_y = 0.0
-    for i, x in enumerate(accomp):
-        y[i] = x - prev_x + rc * prev_y
-        prev_x = x
-        prev_y = y[i]
-    return y
-
-
-# =========================================================
-# REMOTE GENERATOR CLIENT
-# =========================================================
-
-def call_remote_music_model(vocal_bytes: bytes, style: str) -> bytes | None:
-    """
-    Call an external AI music/accompaniment model.
-    Returns raw audio bytes (wav/mp3) or None on failure.
-
-    This version is written like a Replicate / generic HTTP model.
-    Adjust the URL/payload to match the provider you choose.
-    """
-    remote_url = os.environ.get("REMOTE_MUSIC_URL")
-    remote_token = os.environ.get("REMOTE_MUSIC_TOKEN")
-
-    if not remote_url or not remote_token:
-        return None  # not configured
-
-    # some APIs like base64 input
-    vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
-
-    payload = {
-        "input_vocal": vocal_b64,
-        "style": style,
-        "tempo": None,
-    }
-
-    try:
-        resp = requests.post(
-            remote_url,
-            headers={"Authorization": f"Bearer {remote_token}"},
-            json=payload,
-            timeout=180,
-        )
-        if resp.status_code != 200:
-            print("[remote-model] bad status:", resp.status_code, resp.text)
-            return None
-
-        data = resp.json()
-        # assume API returns base64 audio
-        if "audio_b64" in data:
-            return base64.b64decode(data["audio_b64"])
-
-        # or a direct URL
-        if "audio_url" in data:
-            audio_resp = requests.get(data["audio_url"], timeout=180)
-            if audio_resp.status_code == 200:
-                return audio_resp.content
-
-    except Exception as e:
-        print("[remote-model] ERROR:", e)
-
-    return None
-
-
-# ==========================================================
-# MASTERING API
-# ==========================================================
 def call_mastering_api(audio_bytes: bytes) -> bytes | None:
-    """
-    Sends the audio to a mastering/processing API (Auphonic / Dolby).
-    Returns mastered audio bytes, or None if it fails.
-    """
     master_url = os.environ.get("MASTERING_URL")
     master_token = os.environ.get("MASTERING_TOKEN")
     master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
 
     if not (master_url and master_token and master_enabled):
-        return None  # not configured
+        return None
 
     try:
         files = {"audio": ("mix.wav", audio_bytes, "audio/wav")}
@@ -431,7 +291,6 @@ def call_mastering_api(audio_bytes: bytes) -> bytes | None:
         if resp.status_code != 200:
             print("[mastering] bad status:", resp.status_code, resp.text)
             return None
-        # assuming API returns raw audio — some return JSON with URL instead
         return resp.content
     except Exception as e:
         print("[mastering] ERROR:", e)
@@ -439,7 +298,7 @@ def call_mastering_api(audio_bytes: bytes) -> bytes | None:
 
 
 # =========================================================
-# RENDER MIDI BAND
+# MIDI RENDERER (fallback)
 # =========================================================
 def render_midi_band(
     sr: int,
@@ -455,16 +314,12 @@ def render_midi_band(
     if not os.path.exists(SOUNDFONT_PATH):
         ensure_soundfont_safe()
     if not os.path.exists(SOUNDFONT_PATH):
-        raise ValueError(
-            f"SoundFont not found at {SOUNDFONT_PATH}. "
-            "Upload it or set SOUNDFONT_URL."
-        )
+        raise ValueError(f"SoundFont not found at {SOUNDFONT_PATH}")
 
     root_midi = midi_note_from_freq(root_freq)
     bar_seconds = 60.0 / bpm * 4
     bars = int(np.ceil(duration / bar_seconds)) + 1
     progression = build_chord_progression(root_midi, style, bars)
-
     sixteenth = bar_seconds / 16.0
 
     pm = pretty_midi.PrettyMIDI()
@@ -599,7 +454,7 @@ def render_midi_band(
                 )
                 t += beat
 
-            else:  # fallback
+            else:
                 drum.notes.append(
                     pretty_midi.Note(
                         velocity=110,
@@ -642,7 +497,7 @@ def render_midi_band(
             tbar += bar_seconds
         pm.instruments.append(guitar)
 
-    # render via fluidsynth
+    # render with fluidsynth
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpwav:
         tmp_path = tmpwav.name
 
@@ -657,53 +512,41 @@ def render_midi_band(
 
 
 # =========================================================
-# REPLICATE MODEL VERSION
+# REPLICATE: meta/musicgen (melody)
 # =========================================================
-
 REPLICATE_MODEL_VERSION = os.environ.get(
     "REPLICATE_MODEL_VERSION",
-    "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",  # meta/musicgen current version
+    "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
 )
 
+def build_gospel_prompt(bpm: float, key: str | None) -> str:
+    base = (
+        "slow Nigerian gospel / worship backing track, warm piano, soft drums, "
+        "subtle bass, ambient pads, no lead vocals, mixed and spatial, "
+        "tight timing, congregational feel"
+    )
+    parts = [base]
+    if bpm:
+        parts.append(f"{int(bpm)} BPM")
+    if key:
+        parts.append(f"in key of {key}")
+    return ", ".join(parts)
+
+
 def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
-    """
-    Call Replicate's meta/musicgen (melody) to generate a backing track.
-    Docs: https://replicate.com/meta/musicgen/api
-    """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     if not api_token:
         print("[replicate] REPLICATE_API_TOKEN not set")
         return None
 
-    url = f"https://api.replicate.com/v1/predictions"
-
-    # Replicate expects an input with the fields from the model page:
-    # model_version, prompt, input_audio, duration, continuation, etc. :contentReference[oaicite:1]{index=1}
-    payload = {
-        "version": REPLICATE_MODEL_VERSION,
-        "input": {
-            "model_version": "stereo-melody-large",  # default on the page
-            "prompt": prompt,
-            # we must supply the file as a URL or as multipart upload.
-            # For simplicity, we'll upload via files= ... (see below)
-            "duration": duration,
-            "continuation": False,
-            "output_format": "wav",
-            # if you want it to *continue* the vocal instead of just follow melody:
-            # "continuation": True,
-        },
-    }
-
+    pred_url = "https://api.replicate.com/v1/predictions"
     headers = {
         "Authorization": f"Token {api_token}",
         "Content-Type": "application/json",
     }
 
-    # 1) create prediction
     try:
-        # we can't put raw bytes into JSON, so we first upload the audio to Replicate's files endpoint
-        # but Replicate also accepts direct upload via `input_audio` as a URL.
-        # Easiest: upload file to Replicate's /v1/files
+        # 1) upload the vocal file
         file_resp = requests.post(
             "https://api.replicate.com/v1/files",
             headers={"Authorization": f"Token {api_token}"},
@@ -717,10 +560,20 @@ def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: in
         file_data = file_resp.json()
         file_url = file_data["urls"]["get"]
 
-        # now tell the prediction to use that uploaded file
-        payload["input"]["input_audio"] = file_url
+        payload = {
+            "version": REPLICATE_MODEL_VERSION,
+            "input": {
+                "model_version": "stereo-melody-large",
+                "prompt": prompt,
+                "input_audio": file_url,
+                "duration": duration,
+                "continuation": False,
+                "output_format": "wav",
+            },
+        }
 
-        pred_resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        # 2) create prediction
+        pred_resp = requests.post(pred_url, headers=headers, data=json.dumps(payload), timeout=60)
         if pred_resp.status_code not in (200, 201):
             print("[replicate] prediction create failed:", pred_resp.status_code, pred_resp.text)
             return None
@@ -728,9 +581,9 @@ def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: in
         prediction = pred_resp.json()
         pred_id = prediction["id"]
 
-        # 2) poll until finished
+        # 3) poll
         status = prediction["status"]
-        get_url = f"{url}/{pred_id}"
+        get_url = f"{pred_url}/{pred_id}"
         while status not in ("succeeded", "failed", "canceled"):
             poll = requests.get(get_url, headers=headers, timeout=60)
             prediction = poll.json()
@@ -740,8 +593,6 @@ def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: in
             print("[replicate] prediction failed:", prediction)
             return None
 
-        # 3) download output
-        # For meta/musicgen, output is a single URL to the WAV. :contentReference[oaicite:2]{index=2}
         output_urls = prediction.get("output")
         if not output_urls:
             return None
@@ -753,22 +604,28 @@ def call_replicate_musicgen_gospel(vocal_bytes: bytes, prompt: str, duration: in
         audio_resp = requests.get(audio_url, timeout=120)
         if audio_resp.status_code == 200:
             return audio_resp.content
-        return None
 
     except Exception as e:
         print("[replicate] ERROR:", e)
-        return None
 
+    return None
 
 
 # =========================================================
 # ROUTES
 # =========================================================
+@app.get("/")
+async def root_ui():
+    idx = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(idx):
+        return FileResponse(idx)
+    return {"detail": "Vocal Accompaniment API running"}
+
 
 @app.post("/generate")
 async def generate(
     request: Request,
-    style: str = Query("gospel"),   # default to gospel now
+    style: str = Query("nigerian_gospel"),
     piano: bool = Query(True),
     bass: bool = Query(True),
     drums: bool = Query(True),
@@ -778,43 +635,31 @@ async def generate(
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # ----- 1) load vocal locally -----
+    # ---- load vocal and analyze ----
     vocal, sr = load_audio_from_bytes(raw)
-
-    # analyze vocal first
-vocal, sr = load_audio_from_bytes(raw)
-f0 = estimate_key_freq(vocal, sr)
-bpm = estimate_tempo(vocal, sr)
-key_name = rough_key_from_freq(f0)
-
-gospel_prompt = build_gospel_prompt(bpm, key_name)
-
-remote_band_bytes = call_replicate_musicgen_gospel(
-    vocal_bytes=raw,
-    prompt=gospel_prompt,
-    duration=int(len(vocal) / sr) if len(vocal) / sr < 30 else 30,  # cap at 30s
-)
-    # analyse vocal
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
 
-    # ----- 2) try gospel remote model -----
-    remote_band_bytes = call_remote_gospel_model(raw, bpm, key_name)
+    # ---- try remote Replicate first ----
+    gospel_prompt = build_gospel_prompt(bpm, key_name)
+    remote_band_bytes = call_replicate_musicgen_gospel(
+        vocal_bytes=raw,
+        prompt=gospel_prompt,
+        duration=int(len(vocal) / sr) if len(vocal) / sr < 30 else 30,
+    )
 
     if remote_band_bytes is not None:
-        # decode remote band
         band, band_sr = load_audio_from_bytes(remote_band_bytes)
 
-        # align tempos a bit (optional)
+        # align / resample
         if band_sr != sr:
-            # cheap resample via librosa
             band = librosa.resample(band, orig_sr=band_sr, target_sr=sr)
             band_sr = sr
 
-        aligned_band = align_to_vocal(vocal, band, sr, target_bpm=bpm, band_bpm=bpm)  # using same bpm for now
+        aligned_band = align_to_vocal(vocal, band, sr, target_bpm=bpm, band_bpm=bpm)
 
-        # mix (gospel-friendly: vocal on top, band lower, more space)
+        # gospel mix: vocal on top
         aligned_band = simple_highpass(aligned_band, sr, cutoff=130.0)
         v_r = rms(vocal)
         b_r = rms(aligned_band)
@@ -826,12 +671,11 @@ remote_band_bytes = call_replicate_musicgen_gospel(
         if peak > 1.0:
             mix = mix / peak
 
-        # to wav bytes
+        # to wav
         buf = io.BytesIO()
         wavfile.write(buf, sr, (mix * 32767).astype(np.int16))
         buf.seek(0)
 
-        # optional mastering
         mastered = call_mastering_api(buf.getvalue())
         final_bytes = mastered if mastered is not None else buf.getvalue()
 
@@ -841,7 +685,7 @@ remote_band_bytes = call_replicate_musicgen_gospel(
             headers={"Content-Disposition": 'attachment; filename="gospel_accompaniment.wav"'},
         )
 
-    # ----- 3) FALLBACK: local MIDI engine (the one we built before) -----
+    # ---- FALLBACK: local MIDI band ----
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
     duration = len(vocal) / sr
