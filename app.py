@@ -487,7 +487,7 @@ def call_replicate_musicgen_follow_vocal(
             "input_audio": input_audio_uri,
             "duration": duration,
             "output_format": "wav",
-            "model_version": "stereo-large",
+            "model_version": "stereo-melody-large",
         },
     }
 
