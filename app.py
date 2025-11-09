@@ -423,8 +423,8 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
         if not file_id:
             print("[replicate-upload] no id in resp:", data)
             return None
-
-      return f"replicate://{data['id']}"
+            
+            return f"replicate://{data['id']}"
 
 
 def call_replicate_musicgen_follow_vocal(
