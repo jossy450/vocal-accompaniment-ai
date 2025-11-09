@@ -21,6 +21,41 @@ from pydub import AudioSegment
 from pydub.utils import which
 
 
+def replicate_upload_file(audio_bytes: bytes) -> str | None:
+    """
+    Upload user vocal to Replicate so musicgen can condition on it.
+    """
+    api_token = os.environ.get("REPLICATE_API_TOKEN")
+    if not api_token:
+        print("[replicate-upload] missing token")
+        return None
+
+    url = "https://api.replicate.com/v1/files"
+    headers = {
+        "Authorization": f"Token {api_token}",
+    }
+
+    # IMPORTANT: field name must be "content"
+    files = {
+        "content": ("vocal.wav", audio_bytes, "audio/wav"),
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, files=files, timeout=60)
+        if resp.status_code != 200:
+            print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+        file_id = data.get("id")
+        if not file_id:
+            print("[replicate-upload] no id in response:", data)
+            return None
+        return f"replicate://{file_id}"
+    except Exception as e:
+        print("[replicate-upload] ERROR:", e)
+        return None
+
+
 # =========================================================
 # BASIC PATHS
 # =========================================================
@@ -438,34 +473,29 @@ def call_replicate_musicgen_follow_vocal(
         print("[replicate] token missing")
         return None
 
-    # 1) upload the user vocal to replicate
+    # upload the vocal first
     input_audio_uri = replicate_upload_file(vocal_bytes)
     if not input_audio_uri:
         print("[replicate] could not upload input audio")
         return None
 
-    # 2) build a rich prompt
-    # we tell it exactly what band we want
-    # you can tweak this wording to taste
-    prompt_parts = [
-        "Nigerian gospel / worship full band backing track",
-        "real instruments: grand piano, warm bass guitar, live drums, gentle pads, light guitar",
+    # rich prompt
+    base_parts = [
+        "Nigerian gospel / West African worship full band backing track",
+        "grand piano, bass guitar, live drums, gentle pads, light guitar",
         "no vocals, instrumental accompaniment only",
-        "radio-ready, studio quality, tight timing, modern mix",
+        "studio quality, radio mix",
     ]
-    # add style-specific text
     style_prompt = build_style_prompt(style, bpm=bpm, key=key)
-    prompt_parts.append(style_prompt)
+    base_parts.append(style_prompt)
     if bpm:
-        prompt_parts.append(f"{int(bpm)} BPM")
+        base_parts.append(f"{int(bpm)} BPM")
     if key:
-        prompt_parts.append(f"in the key of {key}")
-    full_prompt = ", ".join(prompt_parts)
+        base_parts.append(f"in key of {key}")
+    full_prompt = ", ".join(base_parts)
 
-    # 3) call replicate prediction
     model_version = os.environ.get(
         "REPLICATE_MODEL_VERSION",
-        # musicgen stereo large – adjust to the one you actually use
         "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
     )
 
@@ -478,13 +508,10 @@ def call_replicate_musicgen_follow_vocal(
         "version": model_version,
         "input": {
             "prompt": full_prompt,
-            "input_audio": input_audio_uri,        # <— THIS is the difference
+            "input_audio": input_audio_uri,
             "duration": duration,
             "output_format": "wav",
             "model_version": "stereo-large",
-            # many musicgen-ish models have something like:
-            # "continuation": True,
-            # but keep it commented unless your exact version supports it
         },
     }
 
@@ -495,9 +522,8 @@ def call_replicate_musicgen_follow_vocal(
             return None
 
         pred = resp.json()
-        pred_id = pred["id"]
+        poll_url = f"{url}/{pred['id']}"
         status = pred["status"]
-        poll_url = f"{url}/{pred_id}"
 
         import time
         while status not in ("succeeded", "failed", "canceled"):
@@ -520,6 +546,7 @@ def call_replicate_musicgen_follow_vocal(
         return None
 
     return None
+
 
 
 
@@ -824,107 +851,86 @@ async def generate(
     drums: bool = Query(True),
     guitar: bool = Query(False),
 ):
-    # ------------------ 1. get audio ------------------
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "No audio data received")
 
     vocal, sr = load_audio_from_bytes(raw)
 
-    # ------------------ 2. analyse vocal ------------------
+    # analyse
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
-
-    # adjust tempo a bit based on style (like your MIDI fallback does)
     style_def = STYLE_SETTINGS.get(style, {})
     ai_bpm = bpm * style_def.get("tempo_mult", 1.0)
-
-    # max length we’ll ask the AI model for
     max_dur_sec = int(min(len(vocal) / sr, 30))
 
-    # build a descriptive prompt for the models
-    style_prompt = build_style_prompt(style, bpm=ai_bpm, key=key_name)
-
-    # this will hold the AI accompaniment bytes if any of the remote calls work
-    accomp_bytes: bytes | None = None
-
-    # ------------------ 3. try Replicate first ------------------
-   
+    # 1) try Replicate with vocal conditioning
     accomp_bytes = call_replicate_musicgen_follow_vocal(
-    vocal_bytes=raw,
-    style=style,
-    bpm=ai_bpm,
-    key=key_name,
-    duration=max_dur_sec,
-)
+        vocal_bytes=raw,
+        style=style,
+        bpm=ai_bpm,
+        key=key_name,
+        duration=max_dur_sec,
+    )
 
-    # ------------------ 4. if Replicate failed → try simple HF model ------------------
-    if accomp_bytes is None:
-        print("⚠️ Replicate failed, trying Hugging Face musicgen-melody fallback...")
-        try:
-            hf_io = call_hf_musicgen_fallback(
-                vocal_bytes=raw,
-                prompt=style_prompt,
-                duration=max_dur_sec,
-            )
-            if hf_io is not None:
-                accomp_bytes = hf_io.read()
-        except Exception as e:
-            print("❌ HF musicgen-melody fallback error:", e)
-
-    # ------------------ 5. if that also failed → try your HF Space endpoint ------------------
-    if accomp_bytes is None:
-        print("⚠️ HF fallback also missing, trying HF Space (if configured)...")
-        space_bytes = call_hf_musicgen(
-            vocal_bytes=raw,
-            prompt=style_prompt,
-            duration=max_dur_sec,
-        )
-        if space_bytes is not None:
-            accomp_bytes = space_bytes
-
-    # ------------------ 6. if ANY remote model worked → mix and return ------------------
     if accomp_bytes is not None:
         band_audio, band_sr = load_audio_from_bytes(accomp_bytes)
-
-        # resample to match vocal
         if band_sr != sr:
             band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
 
-        # gentle highpass to keep kick/bass from fighting the vocal
         band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
 
-        # level-match accompaniment to vocal
-        v_r = rms(vocal)
-        b_r = rms(band_audio)
+        v_r = rms(vocal); b_r = rms(band_audio)
         if b_r > 0:
             band_audio = band_audio * (v_r / (b_r * 1.4))
 
         mix = vocal + 0.8 * band_audio
-
-        # safety normalize
         peak = float(np.max(np.abs(mix)) + 1e-9)
         if peak > 1.0:
             mix = mix / peak
 
-        # 1) turn to wav bytes
         mixed_bytes = _to_wav_bytes(mix, sr)
-
-        # 2) run mastering (remote or local)
         mastered_bytes = call_mastering_api(mixed_bytes)
 
-        # 3) return mastered audio
         return StreamingResponse(
             io.BytesIO(mastered_bytes),
             media_type="audio/wav",
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # ------------------ 7. all remote options failed → local MIDI fallback ------------------
-    print("[pipeline] all remote backends failed → using local MIDI band")
-    duration = len(vocal) / sr
+    # 2) if Replicate failed: try your HF Space (only if it’s up)
+    hf_band = call_hf_musicgen(
+        vocal_bytes=raw,
+        prompt=build_style_prompt(style, bpm=ai_bpm, key=key_name),
+        duration=max_dur_sec,
+    )
+    if hf_band is not None:
+        band_audio, band_sr = load_audio_from_bytes(hf_band)
+        if band_sr != sr:
+            band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
 
+        band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
+        v_r = rms(vocal); b_r = rms(band_audio)
+        if b_r > 0:
+            band_audio = band_audio * (v_r / (b_r * 1.4))
+
+        mix = vocal + 0.75 * band_audio
+        peak = float(np.max(np.abs(mix)) + 1e-9)
+        if peak > 1.0:
+            mix = mix / peak
+
+        mixed_bytes = _to_wav_bytes(mix, sr)
+        mastered_bytes = call_mastering_api(mixed_bytes)
+
+        return StreamingResponse(
+            io.BytesIO(mastered_bytes),
+            media_type="audio/wav",
+            headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+        )
+
+    # 3) final fallback: local MIDI (this already works now)
+    duration = len(vocal) / sr
     band = render_midi_band(
         sr,
         duration,
@@ -937,15 +943,12 @@ async def generate(
         use_guitar=guitar,
     )
 
-    # match lengths
     min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
     band = band[:min_len]
 
-    # same mixing logic
     band = simple_highpass(band, sr, cutoff=130.0)
-    v_r = rms(vocal)
-    b_r = rms(band)
+    v_r = rms(vocal); b_r = rms(band)
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
@@ -954,13 +957,9 @@ async def generate(
     if peak > 1.0:
         mix = mix / peak
 
-    # 1) turn to wav bytes
     mixed_bytes = _to_wav_bytes(mix, sr)
-
-    # 2) run mastering (remote or local)
     mastered_bytes = call_mastering_api(mixed_bytes)
 
-    # 3) return mastered audio
     return StreamingResponse(
         io.BytesIO(mastered_bytes),
         media_type="audio/wav",
