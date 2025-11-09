@@ -853,19 +853,29 @@ async def generate(
 
     if accomp_bytes is not None:
         band_audio, band_sr = load_audio_from_bytes(accomp_bytes)
-        if band_sr != sr:
-            band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
-
+    if band_sr != sr:
+        band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
+        # clean a bit
         band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
 
-        v_r = rms(vocal); b_r = rms(band_audio)
-        if b_r > 0:
-            band_audio = band_audio * (v_r / (b_r * 1.4))
+        # level-match band to vocal
+        v_r = rms(vocal)
+        b_r = rms(band_audio)
+    if  b_r > 0:
+        band_audio = band_audio * (v_r / (b_r * 1.4))
 
+    # 🔴 make lengths equal before mixing
+        min_len = min(len(vocal), len(band_audio))
+        vocal = vocal[:min_len]
+        band_audio = band_audio[:min_len]
+
+    # mix
         mix = vocal + 0.8 * band_audio
+
+    # peak protect
         peak = float(np.max(np.abs(mix)) + 1e-9)
-        if peak > 1.0:
-            mix = mix / peak
+    if peak > 1.0:
+        mix = mix / peak
 
         mixed_bytes = _to_wav_bytes(mix, sr)
         mastered_bytes = call_mastering_api(mixed_bytes)
