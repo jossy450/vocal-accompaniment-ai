@@ -6,6 +6,7 @@ import numpy as np
 import requests
 import json
 import base64
+import librosa
 
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, FileResponse
@@ -18,6 +19,27 @@ import pretty_midi
 from pydub import AudioSegment
 from pydub.utils import which
 
+
+# =========================================================
+# ALIGN TO VOCAL
+# =========================================================
+
+def align_to_vocal(vocal: np.ndarray, band: np.ndarray, sr: int, target_bpm: float, band_bpm: float | None = None) -> np.ndarray:
+    """
+    Stretch the band to match vocal tempo.
+    If band_bpm is unknown, we just return band.
+    """
+    if not band_bpm or band_bpm <= 0:
+        return band
+
+    rate = target_bpm / band_bpm
+    # librosa.effects.time_stretch wants float32
+    band_float = band.astype(np.float32)
+    stretched = librosa.effects.time_stretch(band_float, rate)
+    # make length match vocal
+    min_len = min(len(vocal), len(stretched))
+    return stretched[:min_len]
+    
 # =========================================================
 # REMOTE MUSIC MODEL
 # =========================================================
@@ -637,73 +659,71 @@ def render_midi_band(
 # =========================================================
 # ROUTES
 # =========================================================
+
 @app.post("/generate")
 async def generate(
     request: Request,
-    style: str = Query("afrobeat"),
+    style: str = Query("gospel"),   # default to gospel now
     piano: bool = Query(True),
     bass: bool = Query(True),
     drums: bool = Query(True),
     guitar: bool = Query(False),
 ):
-    # raw upload (keep this for remote call)
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "No audio data received")
 
-    # =====================================================
-    # 1) TRY SOPHISTICATED REMOTE MODEL FIRST
-    # =====================================================
-    remote_audio = call_remote_music_model(raw, style)
-    if remote_audio is not None:
-        # we have a band from the model — now mix it with the original vocal
-        # load vocal
-        vocal, sr = load_audio_from_bytes(raw)
-        # load remote band
-        band, sr_band = load_audio_from_bytes(remote_audio)
-        # resample / align if SR differs
-        if sr_band != sr:
-            # quick-and-dirty: trim to min len
-            min_len = min(len(vocal), len(band))
-            vocal = vocal[:min_len]
-            band = band[:min_len]
-        else:
-            min_len = min(len(vocal), len(band))
-            vocal = vocal[:min_len]
-            band = band[:min_len]
+    # ----- 1) load vocal locally -----
+    vocal, sr = load_audio_from_bytes(raw)
 
-        # light ducking so vocal sits on top
-        band = simple_highpass(band, sr, cutoff=140.0)
+    # analyse vocal
+    f0 = estimate_key_freq(vocal, sr)
+    bpm = estimate_tempo(vocal, sr)
+    key_name = rough_key_from_freq(f0)
+
+    # ----- 2) try gospel remote model -----
+    remote_band_bytes = call_remote_gospel_model(raw, bpm, key_name)
+
+    if remote_band_bytes is not None:
+        # decode remote band
+        band, band_sr = load_audio_from_bytes(remote_band_bytes)
+
+        # align tempos a bit (optional)
+        if band_sr != sr:
+            # cheap resample via librosa
+            band = librosa.resample(band, orig_sr=band_sr, target_sr=sr)
+            band_sr = sr
+
+        aligned_band = align_to_vocal(vocal, band, sr, target_bpm=bpm, band_bpm=bpm)  # using same bpm for now
+
+        # mix (gospel-friendly: vocal on top, band lower, more space)
+        aligned_band = simple_highpass(aligned_band, sr, cutoff=130.0)
         v_r = rms(vocal)
-        b_r = rms(band)
+        b_r = rms(aligned_band)
         if b_r > 0:
-            band = band * (v_r / (b_r * 1.3))
-        # no complicated sidechain — remote audio already mixed
-        mix = vocal * 0.98 + band * 0.7
+            aligned_band = aligned_band * (v_r / (b_r * 1.4))
+
+        mix = vocal * 1.0 + aligned_band * 0.7
         peak = np.max(np.abs(mix)) + 1e-9
         if peak > 1.0:
             mix = mix / peak
 
-        # to bytes
+        # to wav bytes
         buf = io.BytesIO()
         wavfile.write(buf, sr, (mix * 32767).astype(np.int16))
         buf.seek(0)
+
+        # optional mastering
         mastered = call_mastering_api(buf.getvalue())
         final_bytes = mastered if mastered is not None else buf.getvalue()
 
         return StreamingResponse(
             io.BytesIO(final_bytes),
             media_type="audio/wav",
-            headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+            headers={"Content-Disposition": 'attachment; filename="gospel_accompaniment.wav"'},
         )
 
-    # =====================================================
-    # 2) FALLBACK: YOUR CURRENT LOCAL MIDI ENGINE
-    # =====================================================
-    vocal, sr = load_audio_from_bytes(raw)
-
-    f0 = estimate_key_freq(vocal, sr)
-    bpm = estimate_tempo(vocal, sr)
+    # ----- 3) FALLBACK: local MIDI engine (the one we built before) -----
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
     duration = len(vocal) / sr
@@ -724,21 +744,13 @@ async def generate(
     vocal = vocal[:min_len]
     band = band[:min_len]
 
-    band = simple_highpass(band, sr, cutoff=140.0)
+    band = simple_highpass(band, sr, cutoff=130.0)
     v_r = rms(vocal)
     b_r = rms(band)
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
-    env = np.abs(vocal)
-    win = 256
-    kernel = np.ones(win) / win
-    env_smooth = np.convolve(env, kernel, mode="same")
-    duck_amount = 0.45
-    band_gain = 1.0 - duck_amount * np.clip(env_smooth * 4.0, 0.0, 1.0)
-    band = band * band_gain
-
-    mix = vocal * 0.98 + band * 0.9
+    mix = vocal * 1.0 + band * 0.85
     peak = np.max(np.abs(mix)) + 1e-9
     if peak > 1.0:
         mix = mix / peak
@@ -750,5 +762,5 @@ async def generate(
     return StreamingResponse(
         out_buf,
         media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+        headers={"Content-Disposition": 'attachment; filename="gospel_accompaniment.wav"'},
     )
