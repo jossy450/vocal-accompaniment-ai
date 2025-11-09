@@ -391,6 +391,138 @@ REPLICATE_MODEL_VERSION = os.environ.get(
     "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
 )
 
+def replicate_upload_file(audio_bytes: bytes) -> str | None:
+    """
+    Upload a file to Replicate and return its file URI, e.g. 'replicate://file-abc123'.
+    """
+    api_token = os.environ.get("REPLICATE_API_TOKEN")
+    if not api_token:
+        print("[replicate-upload] missing token")
+        return None
+
+    files_url = "https://api.replicate.com/v1/files"
+    headers = {
+        "Authorization": f"Token {api_token}",
+    }
+
+    files = {
+        "file": ("vocal.wav", audio_bytes, "audio/wav"),
+    }
+
+    try:
+        resp = requests.post(files_url, headers=headers, files=files, timeout=60)
+        if resp.status_code != 200:
+            print("[replicate-upload] bad status:", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+        # Replicate returns an id like "file-xxxxx"
+        file_id = data.get("id")
+        if not file_id:
+            print("[replicate-upload] no file id in response:", data)
+            return None
+        return f"replicate://{file_id}"
+    except Exception as e:
+        print("[replicate-upload] ERROR:", e)
+        return None
+
+
+def call_replicate_musicgen_follow_vocal(
+    vocal_bytes: bytes,
+    style: str,
+    bpm: float | None,
+    key: str | None,
+    duration: int = 30,
+) -> bytes | None:
+    api_token = os.environ.get("REPLICATE_API_TOKEN")
+    if not api_token:
+        print("[replicate] token missing")
+        return None
+
+    # 1) upload the user vocal to replicate
+    input_audio_uri = replicate_upload_file(vocal_bytes)
+    if not input_audio_uri:
+        print("[replicate] could not upload input audio")
+        return None
+
+    # 2) build a rich prompt
+    # we tell it exactly what band we want
+    # you can tweak this wording to taste
+    prompt_parts = [
+        "Nigerian gospel / worship full band backing track",
+        "real instruments: grand piano, warm bass guitar, live drums, gentle pads, light guitar",
+        "no vocals, instrumental accompaniment only",
+        "radio-ready, studio quality, tight timing, modern mix",
+    ]
+    # add style-specific text
+    style_prompt = build_style_prompt(style, bpm=bpm, key=key)
+    prompt_parts.append(style_prompt)
+    if bpm:
+        prompt_parts.append(f"{int(bpm)} BPM")
+    if key:
+        prompt_parts.append(f"in the key of {key}")
+    full_prompt = ", ".join(prompt_parts)
+
+    # 3) call replicate prediction
+    model_version = os.environ.get(
+        "REPLICATE_MODEL_VERSION",
+        # musicgen stereo large – adjust to the one you actually use
+        "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
+    )
+
+    url = "https://api.replicate.com/v1/predictions"
+    headers = {
+        "Authorization": f"Token {api_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "version": model_version,
+        "input": {
+            "prompt": full_prompt,
+            "input_audio": input_audio_uri,        # <— THIS is the difference
+            "duration": duration,
+            "output_format": "wav",
+            "model_version": "stereo-large",
+            # many musicgen-ish models have something like:
+            # "continuation": True,
+            # but keep it commented unless your exact version supports it
+        },
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=40)
+        if resp.status_code not in (200, 201):
+            print("[replicate] create failed:", resp.text[:200])
+            return None
+
+        pred = resp.json()
+        pred_id = pred["id"]
+        status = pred["status"]
+        poll_url = f"{url}/{pred_id}"
+
+        import time
+        while status not in ("succeeded", "failed", "canceled"):
+            time.sleep(3)
+            pr = requests.get(poll_url, headers=headers, timeout=40)
+            pred = pr.json()
+            status = pred.get("status", "")
+
+        if status != "succeeded":
+            print("[replicate] prediction failed:", pred)
+            return None
+
+        output = pred.get("output")
+        audio_url = output[0] if isinstance(output, list) else output
+        audio_resp = requests.get(audio_url, timeout=60)
+        if audio_resp.status_code == 200:
+            return audio_resp.content
+    except Exception as e:
+        print("[replicate] ERROR:", e)
+        return None
+
+    return None
+
+
+
 
 def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
     base = (
@@ -405,36 +537,19 @@ def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
     return ", ".join(parts)
 
 
-def call_replicate_musicgen(
-    vocal_bytes: bytes,
-    style: str,
-    bpm: float | None,
-    key: str | None,
-    duration: int = 30,
-) -> bytes | None:
-    """
-    Call Replicate's meta/musicgen model and ask it to create an
-    instrumental backing that matches the style/tempo/key we detected.
-
-    This version uses a data:audio/... base64 input which matches
-    the schema shown on https://replicate.com/meta/musicgen
-    """
+def call_replicate_musicgen(vocal_bytes: bytes, style: str, bpm: float | None, key: str | None, duration: int = 30) -> bytes | None:
     api_token = os.environ.get("REPLICATE_API_TOKEN")
-    model_version = os.environ.get(
-        "REPLICATE_MODEL_VERSION",
-        # you already put this in Railway – this keeps it in sync
-        "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
-    )
     if not api_token:
-        print("[replicate] REPLICATE_API_TOKEN missing")
+        print("[replicate] token missing")
         return None
 
-    # build an intelligent musical prompt
-    prompt = build_style_prompt(style, bpm=bpm, key=key)
+    # use a current version from the site
+    model_version = os.environ.get(
+        "REPLICATE_MODEL_VERSION",
+        "ed4031145f17b820ff6e17f78a174aaffb3e2080d629c8a4187bf4d7eb9c5f04",
+    )
 
-    # turn uploaded vocal into a data URL (what musicgen expects)
-    vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
-    data_url = f"data:audio/wav;base64,{vocal_b64}"
+    prompt = build_style_prompt(style, bpm=bpm, key=key)
 
     url = "https://api.replicate.com/v1/predictions"
     headers = {
@@ -445,59 +560,43 @@ def call_replicate_musicgen(
         "version": model_version,
         "input": {
             "prompt": prompt,
-            "input_audio": data_url,
-            "output_format": "wav",
-            "model_version": "stereo-large",  # same as UI
             "duration": duration,
-            # you can add "continuation": True here if you want it to follow
-            # the vocal more strictly, but some versions don't expose it
+            "output_format": "wav",
+            # we are NOT sending input_audio here
         },
     }
 
     try:
-        # 1) create prediction
-        resp = requests.post(url, headers=headers, json=payload, timeout=40)
-        if resp.status_code not in (200, 201):
-            print("[replicate] create failed:", resp.text)
+        r = requests.post(url, headers=headers, json=payload, timeout=40)
+        if r.status_code not in (200, 201):
+            print("[replicate] create failed:", r.text[:200])
             return None
 
-        if resp.status_code == 402:
-            print("[replicate] No credits on your Replicate account. Falling back to local MIDI.")
-            return None
+        pred = r.json()
+        poll_url = f"{url}/{pred['id']}"
+        status = pred["status"]
 
-        prediction = resp.json()
-        pred_id = prediction["id"]
-        status = prediction["status"]
-
-        # 2) poll until it's done
-        poll_url = f"{url}/{pred_id}"
+        # poll
+        import time
         while status not in ("succeeded", "failed", "canceled"):
-            import time
-            time.sleep(4)
-            poll_resp = requests.get(poll_url, headers=headers, timeout=40)
-            prediction = poll_resp.json()
-            status = prediction.get("status", "")
+            time.sleep(3)
+            pr = requests.get(poll_url, headers=headers, timeout=40).json()
+            status = pr["status"]
+            pred = pr
 
         if status != "succeeded":
-            print("[replicate] prediction not successful:", prediction)
+            print("[replicate] prediction failed:", pred)
             return None
 
-        # 3) download audio
-        output = prediction.get("output")
-        if isinstance(output, list):
-            audio_url = output[0]
-        else:
-            audio_url = output
-
+        audio_url = pred["output"] if isinstance(pred["output"], str) else pred["output"][0]
         audio_resp = requests.get(audio_url, timeout=60)
         if audio_resp.status_code == 200:
             return audio_resp.content
-
     except Exception as e:
         print("[replicate] ERROR:", e)
+        return None
 
     return None
-
 
 
 def call_hf_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
@@ -751,13 +850,14 @@ async def generate(
     accomp_bytes: bytes | None = None
 
     # ------------------ 3. try Replicate first ------------------
-    accomp_bytes = call_replicate_musicgen(
-        vocal_bytes=raw,
-        style=style,
-        bpm=ai_bpm,
-        key=key_name,
-        duration=max_dur_sec,
-    )
+   
+    accomp_bytes = call_replicate_musicgen_follow_vocal(
+    vocal_bytes=raw,
+    style=style,
+    bpm=ai_bpm,
+    key=key_name,
+    duration=max_dur_sec,
+)
 
     # ------------------ 4. if Replicate failed → try simple HF model ------------------
     if accomp_bytes is None:
@@ -808,8 +908,15 @@ async def generate(
         if peak > 1.0:
             mix = mix / peak
 
+        # 1) turn to wav bytes
+        mixed_bytes = _to_wav_bytes(mix, sr)
+
+        # 2) run mastering (remote or local)
+        mastered_bytes = call_mastering_api(mixed_bytes)
+
+        # 3) return mastered audio
         return StreamingResponse(
-            io.BytesIO(_to_wav_bytes(mix, sr)),
+            io.BytesIO(mastered_bytes),
             media_type="audio/wav",
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
@@ -847,8 +954,15 @@ async def generate(
     if peak > 1.0:
         mix = mix / peak
 
+    # 1) turn to wav bytes
+    mixed_bytes = _to_wav_bytes(mix, sr)
+
+    # 2) run mastering (remote or local)
+    mastered_bytes = call_mastering_api(mixed_bytes)
+
+    # 3) return mastered audio
     return StreamingResponse(
-        io.BytesIO(_to_wav_bytes(mix, sr)),
+        io.BytesIO(mastered_bytes),
         media_type="audio/wav",
         headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
     )
