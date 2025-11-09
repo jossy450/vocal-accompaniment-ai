@@ -424,10 +424,7 @@ def replicate_upload_file(audio_bytes: bytes) -> str | None:
             print("[replicate-upload] no id in resp:", data)
             return None
 
-        return f"replicate://{file_id}"
-    except Exception as e:
-        print("[replicate-upload] ERROR:", e)
-        return None
+      return f"replicate://{data['id']}"
 
 
 def call_replicate_musicgen_follow_vocal(
