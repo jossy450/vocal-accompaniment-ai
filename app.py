@@ -324,6 +324,20 @@ def call_mastering_api(audio_bytes: bytes) -> bytes:
         return audio_bytes
 
 
+def call_hf_musicgen_fallback(vocal_bytes, prompt, duration=30):
+    url = "https://api-inference.huggingface.co/models/facebook/musicgen-melody"
+    headers = {"Authorization": f"Bearer {os.getenv('HF_API_TOKEN')}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {"duration": duration}
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    if resp.status_code == 200:
+        return io.BytesIO(resp.content)
+    else:
+        print("HF API Error:", resp.text)
+        return None
+
 # =========================================================
 # REPLICATE (MusicGen) CALL
 # =========================================================
@@ -402,6 +416,10 @@ def call_replicate_musicgen(
             print("[replicate] create failed:", resp.text)
             return None
 
+        if resp.status_code == 402:
+            print("[replicate] No credits on your Replicate account. Falling back to local MIDI.")
+            return None
+
         prediction = resp.json()
         pred_id = prediction["id"]
         status = prediction["status"]
@@ -434,6 +452,52 @@ def call_replicate_musicgen(
         print("[replicate] ERROR:", e)
 
     return None
+
+
+
+def call_hf_musicgen(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
+    """
+    Call a Hugging Face Space that exposes MusicGen (or similar).
+    You can set HF_MUSICGEN_URL in Railway to point to your Space.
+
+    Expected Space API (Gradio-like):
+    POST { "data": [ prompt, duration ] }  →  returns { "data": [ "https://..." ] }
+    """
+    space_url = os.environ.get("HF_MUSICGEN_URL")
+    if not space_url:
+        # no space configured
+        return None
+
+    try:
+        payload = {
+            "data": [
+                prompt,
+                duration,
+            ]
+        }
+        resp = requests.post(space_url, json=payload, timeout=180)
+        if resp.status_code != 200:
+            print("[hf-musicgen] bad status:", resp.status_code, resp.text)
+            return None
+
+        data = resp.json()
+
+        # Many HF Spaces return a URL in data[0]
+        # adjust this to match your actual Space schema
+        if isinstance(data, dict) and "data" in data and len(data["data"]) > 0:
+            audio_out = data["data"][0]
+            # if it's a URL, download it
+            if isinstance(audio_out, str) and audio_out.startswith("http"):
+                audio_resp = requests.get(audio_out, timeout=120)
+                if audio_resp.status_code == 200:
+                    return audio_resp.content
+
+        print("[hf-musicgen] unexpected response format:", data)
+        return None
+
+    except Exception as e:
+        print("[hf-musicgen] ERROR:", e)
+        return None
 
 
 
@@ -628,9 +692,11 @@ async def generate(
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
 
+    # build a genre-aware prompt (we already wrote this helper earlier)
+    prompt = build_gospel_prompt(bpm, key_name) if "gospel" in style else f"{style} afrobeat backing track, no vocals"
+
     # ------------------ 3. try Replicate first ------------------
-    # this uses the token you set in Railway
-    replicate_band_bytes = call_replicate_musicgen(
+    replicate_band = call_replicate_musicgen(
         vocal_bytes=raw,
         style=style,
         bpm=bpm,
@@ -638,40 +704,79 @@ async def generate(
         duration=int(min(len(vocal) / sr, 30)),
     )
 
-    if replicate_band_bytes is not None:
-        # decode remote band to numpy audio
-        band_audio, band_sr = load_audio_from_bytes(replicate_band_bytes)
+# If Replicate fails or returns None → try Hugging Face
+if not replicate_band_bytes:
+    print("⚠️ Replicate failed, switching to Hugging Face fallback...")
 
-        # resample to match vocal
+    try:
+        hf_audio = call_hf_musicgen_fallback(
+            vocal_bytes=raw,
+            prompt=f"{style} backing track with {key_name} key at {bpm:.1f} BPM",
+            duration=int(min(len(vocal) / sr, 30))
+        )
+        if hf_audio is not None:
+            print("✅ Hugging Face fallback succeeded.")
+            replicate_band_bytes = hf_audio.read()
+        else:
+            print("❌ Hugging Face fallback returned None.")
+    except Exception as e:
+        print("❌ Error calling Hugging Face fallback:", str(e))
+
+    
+    if replicate_band is not None:
+        print("[pipeline] using Replicate result")
+        band_audio, band_sr = load_audio_from_bytes(replicate_band)
         if band_sr != sr:
             band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
 
-        # light cleanup
+        # mix
         band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
-
-        # match loudness to vocal
-        v_r = rms(vocal)
-        b_r = rms(band_audio)
+        v_r = rms(vocal); b_r = rms(band_audio)
         if b_r > 0:
             band_audio = band_audio * (v_r / (b_r * 1.4))
 
-        # mix
-        mix = vocal * 1.0 + band_audio * 0.8
+        mix = vocal + 0.8 * band_audio
         peak = np.max(np.abs(mix)) + 1e-9
         if peak > 1.0:
             mix = mix / peak
 
-        # optional mastering
-        mastered = call_mastering_api(_to_wav_bytes(mix, sr))
-        final_bytes = mastered if mastered is not None else _to_wav_bytes(mix, sr)
-
         return StreamingResponse(
-            io.BytesIO(final_bytes),
+            io.BytesIO(_to_wav_bytes(mix, sr)),
             media_type="audio/wav",
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # ------------------ 4. FALLBACK → local MIDI engine ------------------
+    # ------------------ 4. Replicate failed → try Hugging Face Space ------------------
+    hf_band = call_hf_musicgen(
+        vocal_bytes=raw,
+        prompt=prompt,
+        duration=int(min(len(vocal) / sr, 30)),
+    )
+    if hf_band is not None:
+        print("[pipeline] using HF Space result")
+        band_audio, band_sr = load_audio_from_bytes(hf_band)
+        if band_sr != sr:
+            band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
+
+        # mix
+        band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
+        v_r = rms(vocal); b_r = rms(band_audio)
+        if b_r > 0:
+            band_audio = band_audio * (v_r / (b_r * 1.4))
+
+        mix = vocal + 0.75 * band_audio
+        peak = np.max(np.abs(mix)) + 1e-9
+        if peak > 1.0:
+            mix = mix / peak
+
+        return StreamingResponse(
+            io.BytesIO(_to_wav_bytes(mix, sr)),
+            media_type="audio/wav",
+            headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
+        )
+
+    # ------------------ 5. HF also failed → FALLBACK to local MIDI ------------------
+    print("[pipeline] both Replicate and HF failed → using local MIDI")
     style_def = STYLE_SETTINGS.get(style, {})
     bpm *= style_def.get("tempo_mult", 1.0)
     duration = len(vocal) / sr
@@ -688,15 +793,12 @@ async def generate(
         use_guitar=guitar,
     )
 
-    # trim to same length
     min_len = min(len(vocal), len(band))
     vocal = vocal[:min_len]
     band = band[:min_len]
 
-    # shape band & loudness
     band = simple_highpass(band, sr, cutoff=130.0)
-    v_r = rms(vocal)
-    b_r = rms(band)
+    v_r = rms(vocal); b_r = rms(band)
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
@@ -705,11 +807,8 @@ async def generate(
     if peak > 1.0:
         mix = mix / peak
 
-    mastered = call_mastering_api(_to_wav_bytes(mix, sr))
-    final_bytes = mastered if mastered is not None else _to_wav_bytes(mix, sr)
-
     return StreamingResponse(
-        io.BytesIO(final_bytes),
+        io.BytesIO(_to_wav_bytes(mix, sr)),
         media_type="audio/wav",
         headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
     )
