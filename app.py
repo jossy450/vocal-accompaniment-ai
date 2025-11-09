@@ -278,49 +278,83 @@ def build_chord_progression(root_midi: int, style: str, bars: int) -> list[int]:
 # =========================================================
 def call_mastering_api(audio_bytes: bytes) -> bytes | None:
     """
-    Master the audio using Auphonic.
+    Master the audio using Auphonic if configured.
+    If unavailable or fails, apply local mastering fallback.
 
-    Expects these env vars:
+    Environment variables:
       MASTERING_ENABLED=true
       MASTERING_URL=https://auphonic.com/api/simple/productions.json
-      MASTERING_TOKEN= sOmuFXlhpryFuxzh7AQsWRN4c3JKtbMP
-
-    This uses Auphonic's "simple" endpoint, which returns the processed file
-    directly when 'output_files' is set to 'wav'.
+      MASTERING_TOKEN=<your_auphonic_token>
     """
     master_enabled = os.environ.get("MASTERING_ENABLED", "false").lower() == "true"
     master_url = os.environ.get("MASTERING_URL")
     master_token = os.environ.get("MASTERING_TOKEN")
 
-    if not master_enabled or not master_url or not master_token:
-        return None  # mastering not configured
+    # =============== TRY AUPHONIC API ===============
+    if master_enabled and master_url and master_token:
+        try:
+            files = {"audio_file": ("mix.wav", audio_bytes, "audio/wav")}
+            data = {
+                "token": master_token,
+                "output_files[]": "wav",
+            }
+
+            resp = requests.post(master_url, data=data, files=files, timeout=180)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                print("[mastering] Auphonic mastering successful.")
+                return resp.content
+            else:
+                print(f"[mastering] Auphonic failed ({resp.status_code}). Falling back.")
+        except Exception as e:
+            print("[mastering] ERROR calling Auphonic:", e)
+
+    # =============== LOCAL MASTERING FALLBACK ===============
+    print("[mastering] Using local mastering fallback...")
 
     try:
-        # Auphonic simple API accepts multipart:
-        #   audio_file     -> the file to process
-        #   output_files[] -> format (e.g. wav, mp3)
-        #   token          -> your personal API token
-        files = {
-            "audio_file": ("mix.wav", audio_bytes, "audio/wav"),
-        }
-        data = {
-            "token": master_token,
-            # request WAV back
-            "output_files[]": "wav",
-        }
+        # Convert bytes to numpy
+        import soundfile as sf
+        import io
+        import numpy as np
 
-        resp = requests.post(master_url, data=data, files=files, timeout=180)
-        if resp.status_code != 200:
-            print("[mastering] Auphonic error:", resp.status_code, resp.text[:300])
-            return None
+        mix, sr = sf.read(io.BytesIO(audio_bytes))
+        if mix.ndim > 1:
+            mix = mix.mean(axis=1)
 
-        # Auphonic simple API actually returns the processed file in the body
-        # if you asked for a single file. So we just return resp.content
-        return resp.content
+        # Normalize to -1 dBFS
+        peak = np.max(np.abs(mix)) + 1e-9
+        mix = mix / peak * 0.98
+
+        # Simple RMS compressor
+        rms_val = np.sqrt(np.mean(mix ** 2)) + 1e-9
+        target_rms = 0.08
+        gain = target_rms / rms_val
+        gain = min(gain, 1.5)
+        mix = mix * gain
+
+        # Gentle high-pass to remove mud
+        cutoff = 150.0
+        rc = np.exp(-2 * np.pi * cutoff / sr)
+        y = np.zeros_like(mix)
+        prev_x, prev_y = 0.0, 0.0
+        for i, x in enumerate(mix):
+            y[i] = x - prev_x + rc * prev_y
+            prev_x = x
+            prev_y = y[i]
+        mix = y
+
+        # Re-limit to prevent clipping
+        mix = np.clip(mix, -1.0, 1.0)
+
+        buf = io.BytesIO()
+        sf.write(buf, mix, sr, format="WAV")
+        buf.seek(0)
+        print("[mastering] Local mastering complete.")
+        return buf.getvalue()
 
     except Exception as e:
-        print("[mastering] ERROR calling Auphonic:", e)
-        return None
+        print("[mastering] ERROR in local fallback:", e)
+        return audio_bytes
 
 
 # =========================================================
