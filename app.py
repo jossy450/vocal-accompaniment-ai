@@ -205,8 +205,51 @@ def load_audio_from_bytes(raw: bytes) -> tuple[np.ndarray, int]:
 
 
 # =========================================================
-# SMALL HELPERS
+# SMALL AND BIG HELPERS
 # =========================================================
+
+def build_style_prompt(style: str, bpm: float | None = None, key: str | None = None) -> str:
+    """
+    Turn a style string like 'nigerian_gospel' or 'afrobeat' into a rich,
+    musicgen-friendly text prompt.
+    """
+    style = (style or "").lower()
+    parts: list[str] = []
+
+    if style in ("nigerian_gospel", "gospel", "worship", "praise"):
+        parts.append("Nigerian gospel / worship backing track")
+        parts.append("warm grand piano, soft live drums, bass guitar, gentle pads")
+        parts.append("no lead vocals, for congregational worship, uplifting, spiritual, African feel")
+    elif style == "afrobeat":
+        parts.append("modern afrobeat instrumental, west african groove")
+        parts.append("live drums, conga, bass guitar, electric piano, guitars")
+        parts.append("no vocals, energetic but not too busy, radio mix")
+    elif style == "hi_life":
+        parts.append("Highlife band from West Africa")
+        parts.append("rhythm guitar, shakers, congas, bass, light brass")
+        parts.append("no vocals, sunny, joyful")
+    elif style == "reggae":
+        parts.append("smooth reggae gospel riddim")
+        parts.append("offbeat guitar skank, deep bass, light drums")
+        parts.append("no vocals, worshipful, laid back")
+    else:
+        # default
+        parts.append(f"{style} backing track")
+        parts.append("real instruments, mixed and mastered, no vocals")
+
+    # enrich with tempo and key if we have them
+    if bpm:
+        parts.append(f"{int(bpm)} BPM")
+    if key:
+        parts.append(f"in the key of {key}")
+
+    # always enforce that we don't want AI vocals
+    parts.append("instrumental only, no singing voice")
+
+    return ", ".join(parts)
+
+
+
 def quantize_time(t: float, grid: float) -> float:
     return round(t / grid) * grid
 
@@ -286,58 +329,9 @@ def call_mastering_api(audio_bytes: bytes) -> bytes:
 # =========================================================
 REPLICATE_MODEL_VERSION = os.environ.get(
     "REPLICATE_MODEL_VERSION",
-    "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
+    "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
 )
 
-def build_style_prompt(style: str, bpm: float | None, key: str | None) -> str:
-    """
-    Turn our app style name into a descriptive, musicgen-friendly prompt.
-    This is what makes the remote model sound closer to the genre.
-    """
-    style = (style or "nigerian_gospel").lower()
-    base_parts = []
-
-    # --- style-specific wording ---
-    if style in ("nigerian_gospel", "gospel", "worship"):
-        base_parts.append(
-            "slow Nigerian gospel / worship backing track, warm grand piano, soft live drums, deep bass, mild organ, atmospheric pads, no lead vocals, clean mix"
-        )
-    elif style in ("afrobeat", "afrobeats"):
-        base_parts.append(
-            "modern afrobeats instrumental, West African groove, punchy kick, rimshots, guitar licks, mellow synths, no vocals"
-        )
-    elif style in ("hi_life", "highlife"):
-        base_parts.append(
-            "West African highlife band, bright electric guitars, light percussion, congas, bass guitar, no vocals"
-        )
-    elif style in ("reggae",):
-        base_parts.append(
-            "laid-back reggae riddim, one-drop drums, offbeat guitar skank, round bass, no vocals"
-        )
-    elif style in ("rnb", "r&b"):
-        base_parts.append(
-            "smooth R&B backing track, Rhodes piano, soft drums, sub bass, no vocals, wide stereo"
-        )
-    elif style in ("hip_hop", "rap"):
-        base_parts.append(
-            "modern hip hop / afro-fusion beat, tight drums, 808 bass, plucks, no vocals"
-        )
-    else:
-        # generic fallback
-        base_parts.append(
-            "contemporary Christian / inspirational backing track, piano, bass, drums, no vocals"
-        )
-
-    # --- timing & key hints ---
-    if bpm:
-        base_parts.append(f"{int(bpm)} BPM")
-    if key:
-        base_parts.append(f"in key of {key}")
-
-    # a little production hint
-    base_parts.append("studio mix, balanced, ready for vocals")
-
-    return ", ".join(base_parts)
 
 def build_gospel_prompt(bpm: float, key_name: str | None) -> str:
     base = (
@@ -360,28 +354,26 @@ def call_replicate_musicgen(
     duration: int = 30,
 ) -> bytes | None:
     """
-    Calls the Meta MusicGen model on Replicate to create a realistic instrumental
-    accompaniment matching the given vocal.
+    Call Replicate's meta/musicgen model and ask it to create an
+    instrumental backing that matches the style/tempo/key we detected.
+
+    This version uses a data:audio/... base64 input which matches
+    the schema shown on https://replicate.com/meta/musicgen
     """
     api_token = os.environ.get("REPLICATE_API_TOKEN")
     model_version = os.environ.get(
         "REPLICATE_MODEL_VERSION",
-        "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
+        # you already put this in Railway – this keeps it in sync
+        "2b5dc5f29cee83fd5cdf8f9c92e555aae7ca2a69b73c5182f3065362b2fa0a45",
     )
-
     if not api_token:
-        print("[replicate] missing REPLICATE_API_TOKEN")
+        print("[replicate] REPLICATE_API_TOKEN missing")
         return None
 
-    # Build a smart prompt
-    parts = [f"{style} gospel backing track", "live instruments", "studio mix", "no vocals"]
-    if bpm:
-        parts.append(f"{int(bpm)} BPM")
-    if key:
-        parts.append(f"in the key of {key}")
-    prompt = ", ".join(parts)
+    # build an intelligent musical prompt
+    prompt = build_style_prompt(style, bpm=bpm, key=key)
 
-    # Convert the uploaded vocal to base64 data URL
+    # turn uploaded vocal into a data URL (what musicgen expects)
     vocal_b64 = base64.b64encode(vocal_bytes).decode("utf-8")
     data_url = f"data:audio/wav;base64,{vocal_b64}"
 
@@ -396,46 +388,52 @@ def call_replicate_musicgen(
             "prompt": prompt,
             "input_audio": data_url,
             "output_format": "wav",
-            "model_version": "stereo-large",
-            "normalization_strategy": "peak",
+            "model_version": "stereo-large",  # same as UI
             "duration": duration,
+            # you can add "continuation": True here if you want it to follow
+            # the vocal more strictly, but some versions don't expose it
         },
     }
 
     try:
+        # 1) create prediction
         resp = requests.post(url, headers=headers, json=payload, timeout=40)
         if resp.status_code not in (200, 201):
-            print("[replicate] request failed:", resp.text)
+            print("[replicate] create failed:", resp.text)
             return None
 
-        pred = resp.json()
-        pred_id = pred.get("id")
-        status = pred.get("status", "")
+        prediction = resp.json()
+        pred_id = prediction["id"]
+        status = prediction["status"]
 
-        # Poll until ready
+        # 2) poll until it's done
         poll_url = f"{url}/{pred_id}"
         while status not in ("succeeded", "failed", "canceled"):
-            time.sleep(5)
-            poll_resp = requests.get(poll_url, headers=headers)
-            pred = poll_resp.json()
-            status = pred.get("status", "")
+            import time
+            time.sleep(4)
+            poll_resp = requests.get(poll_url, headers=headers, timeout=40)
+            prediction = poll_resp.json()
+            status = prediction.get("status", "")
 
         if status != "succeeded":
-            print("[replicate] failed:", pred)
+            print("[replicate] prediction not successful:", prediction)
             return None
 
-        output = pred.get("output")
+        # 3) download audio
+        output = prediction.get("output")
         if isinstance(output, list):
-            output_url = output[0]
+            audio_url = output[0]
         else:
-            output_url = output
+            audio_url = output
 
-        audio_data = requests.get(output_url).content
-        return audio_data
+        audio_resp = requests.get(audio_url, timeout=60)
+        if audio_resp.status_code == 200:
+            return audio_resp.content
 
     except Exception as e:
         print("[replicate] ERROR:", e)
-        return None
+
+    return None
 
 
 
