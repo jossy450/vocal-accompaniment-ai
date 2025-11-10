@@ -887,9 +887,10 @@ async def generate(
     if not raw:
         raise HTTPException(400, "No audio data received")
 
+    # 1) load vocal
     vocal, sr = load_audio_from_bytes(raw)
 
-    # analyse
+    # 2) analyse
     f0 = estimate_key_freq(vocal, sr)
     bpm = estimate_tempo(vocal, sr)
     key_name = rough_key_from_freq(f0)
@@ -897,7 +898,9 @@ async def generate(
     ai_bpm = bpm * style_def.get("tempo_mult", 1.0)
     max_dur_sec = int(min(len(vocal) / sr, 30))
 
-    # 1) try Replicate with vocal conditioning
+    # =========================================================
+    # FIRST: try Replicate (preferred)
+    # =========================================================
     accomp_bytes = call_replicate_musicgen_follow_vocal(
         vocal_bytes=raw,
         style=style,
@@ -907,55 +910,64 @@ async def generate(
     )
 
     if accomp_bytes is not None:
+        # turn replicate audio into array
         band_audio, band_sr = load_audio_from_bytes(accomp_bytes)
-    if band_sr != sr:
-        band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
-        # clean a bit
-        band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
 
-        # level-match band to vocal
+        # resample to vocal sr
+        if band_sr != sr:
+            band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
+
+        # clean / match
+        band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
         v_r = rms(vocal)
         b_r = rms(band_audio)
-    if  b_r > 0:
-        band_audio = band_audio * (v_r / (b_r * 1.4))
+        if b_r > 0:
+            band_audio = band_audio * (v_r / (b_r * 1.4))
 
-    # 🔴 make lengths equal before mixing
+        # same length
         min_len = min(len(vocal), len(band_audio))
         vocal = vocal[:min_len]
         band_audio = band_audio[:min_len]
 
-    # mix
+        # mix
         mix = vocal + 0.8 * band_audio
-
-    # peak protect
         peak = float(np.max(np.abs(mix)) + 1e-9)
-    if peak > 1.0:
-        mix = mix / peak
+        if peak > 1.0:
+            mix = mix / peak
 
         mixed_bytes = _to_wav_bytes(mix, sr)
         mastered_bytes = call_mastering_api(mixed_bytes)
 
+        # ✅ EARLY RETURN – we’re done, even if HF is broken
         return StreamingResponse(
             io.BytesIO(mastered_bytes),
             media_type="audio/wav",
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # 2) if Replicate failed: try your HF Space (only if it’s up)
+    # =========================================================
+    # SECOND: try Hugging Face router (may 404 for now)
+    # =========================================================
     hf_band = call_hf_musicgen_safe(
         vocal_bytes=raw,
         prompt=build_style_prompt(style, bpm=ai_bpm, key=key_name),
         duration=max_dur_sec,
-        )
+    )
+
     if hf_band is not None:
         band_audio, band_sr = load_audio_from_bytes(hf_band)
         if band_sr != sr:
             band_audio = librosa.resample(band_audio, orig_sr=band_sr, target_sr=sr)
 
         band_audio = simple_highpass(band_audio, sr, cutoff=130.0)
-        v_r = rms(vocal); b_r = rms(band_audio)
+        v_r = rms(vocal)
+        b_r = rms(band_audio)
         if b_r > 0:
             band_audio = band_audio * (v_r / (b_r * 1.4))
+
+        min_len = min(len(vocal), len(band_audio))
+        vocal = vocal[:min_len]
+        band_audio = band_audio[:min_len]
 
         mix = vocal + 0.75 * band_audio
         peak = float(np.max(np.abs(mix)) + 1e-9)
@@ -971,7 +983,9 @@ async def generate(
             headers={"Content-Disposition": 'attachment; filename="accompaniment.wav"'},
         )
 
-    # 3) final fallback: local MIDI (this already works now)
+    # =========================================================
+    # THIRD: fallback to local MIDI
+    # =========================================================
     duration = len(vocal) / sr
     band = render_midi_band(
         sr,
@@ -990,7 +1004,8 @@ async def generate(
     band = band[:min_len]
 
     band = simple_highpass(band, sr, cutoff=130.0)
-    v_r = rms(vocal); b_r = rms(band)
+    v_r = rms(vocal)
+    b_r = rms(band)
     if b_r > 0:
         band = band * (v_r / (b_r * 1.5))
 
