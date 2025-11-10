@@ -273,42 +273,55 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
 
 def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
     """
-    Try the Space under several possible Gradio routes.
-    Log every failure, but never crash.
+    Call Hugging Face's MusicGen model directly using Inference API.
+    Requires HF_API_TOKEN to be set in environment.
     """
-    base = os.environ.get("HF_MUSICGEN_URL", "").rstrip("/")
-    if not base:
-        print("[hf-musicgen] HF_MUSICGEN_URL not set")
+    hf_token = os.getenv("HF_API_TOKEN")
+    if not hf_token:
+        print("[hf-musicgen] HF_API_TOKEN not set")
         return None
 
-    # most common routes in HF Spaces
-    candidate_paths = [
-        "/run/predict",        # older / simpler gradio
-        "/proxy/run/predict",  # some hosted/proxied spaces
-        "/api/predict/",       # newer gradio style
-    ]
+    url = os.getenv("HF_MUSICGEN_URL", "https://api-inference.huggingface.co/models/facebook/musicgen-small")
 
-    payload = {
-        "data": [
-            prompt,
-            duration,
-        ]
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
     }
 
-    for path in candidate_paths:
-        url = f"{base}{path}"
-        try:
-            resp = requests.post(url, json=payload, timeout=180)
-            if resp.status_code == 200:
-                # success – return bytes
-                return resp.content
-            else:
-                print(f"[hf-musicgen] bad status at {url}: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            print(f"[hf-musicgen] ERROR calling {url}: {e}")
+    payload = {
+        "inputs": prompt,
+        "parameters": {"duration": duration},
+    }
 
-    # none of the routes worked → let the caller fall back to MIDI
-    return None
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+
+        if resp.status_code != 200:
+            print(f"[hf-musicgen] HF API error {resp.status_code}: {resp.text[:200]}")
+            return None
+
+        # Hugging Face returns audio/wav bytes
+        content_type = resp.headers.get("content-type", "")
+        if "audio" in content_type:
+            return resp.content
+
+        # handle if the API returns JSON with an audio URL
+        try:
+            data = resp.json()
+            audio_url = data.get("audio") or data.get("url")
+            if audio_url:
+                audio_resp = requests.get(audio_url, timeout=120)
+                if audio_resp.status_code == 200:
+                    return audio_resp.content
+        except Exception:
+            pass
+
+        print("[hf-musicgen] Unexpected response format.")
+        return None
+
+    except Exception as e:
+        print("[hf-musicgen] Exception:", e)
+        return None
 
 
 # =========================================================
