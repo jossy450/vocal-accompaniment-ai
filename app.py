@@ -273,7 +273,7 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
 
 def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
     """
-    Call Hugging Face's MusicGen model directly using Inference API.
+    Call Hugging Face's new Router Inference API for MusicGen.
     Requires HF_API_TOKEN to be set in environment.
     """
     hf_token = os.getenv("HF_API_TOKEN")
@@ -281,7 +281,8 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
         print("[hf-musicgen] HF_API_TOKEN not set")
         return None
 
-    url = os.getenv("HF_MUSICGEN_URL", "https://api-inference.huggingface.co/models/facebook/musicgen-small")
+    # New unified endpoint
+    url = "https://router.huggingface.co/hf-inference"
 
     headers = {
         "Authorization": f"Bearer {hf_token}",
@@ -289,6 +290,7 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
     }
 
     payload = {
+        "model": "facebook/musicgen-small",
         "inputs": prompt,
         "parameters": {"duration": duration},
     }
@@ -297,22 +299,21 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
 
         if resp.status_code != 200:
-            print(f"[hf-musicgen] HF API error {resp.status_code}: {resp.text[:200]}")
+            print(f"[hf-musicgen] router returned {resp.status_code}: {resp.text[:300]}")
             return None
 
-        # Hugging Face returns audio/wav bytes
-        content_type = resp.headers.get("content-type", "")
-        if "audio" in content_type:
+        # direct audio bytes
+        if "audio" in resp.headers.get("content-type", ""):
             return resp.content
 
-        # handle if the API returns JSON with an audio URL
+        # Sometimes router returns JSON with an audio URL
         try:
             data = resp.json()
             audio_url = data.get("audio") or data.get("url")
             if audio_url:
-                audio_resp = requests.get(audio_url, timeout=120)
-                if audio_resp.status_code == 200:
-                    return audio_resp.content
+                a = requests.get(audio_url, timeout=120)
+                if a.status_code == 200:
+                    return a.content
         except Exception:
             pass
 
@@ -322,7 +323,6 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
     except Exception as e:
         print("[hf-musicgen] Exception:", e)
         return None
-
 
 # =========================================================
 # MASTERING (remote → local fallback)
