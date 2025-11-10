@@ -1,6 +1,5 @@
-FROM python:3.11-slim
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
-# System deps for ffmpeg, fluidsynth, midi rendering
 RUN apt-get update && apt-get install -y ffmpeg fluidsynth libasound2-dev libavcodec-extra python3-dev build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
