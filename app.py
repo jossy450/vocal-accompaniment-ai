@@ -273,17 +273,15 @@ def simple_highpass(accomp: np.ndarray, sr: int, cutoff: float = 150.0) -> np.nd
 
 def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -> bytes | None:
     """
-    Call Hugging Face's new Router Inference API for MusicGen.
-    Requires HF_API_TOKEN to be set in environment.
+    Use Hugging Face router to generate accompaniment from a MusicGen model.
+    Requires HF_API_TOKEN environment variable.
     """
     hf_token = os.getenv("HF_API_TOKEN")
     if not hf_token:
         print("[hf-musicgen] HF_API_TOKEN not set")
         return None
 
-    # New unified endpoint
     url = "https://router.huggingface.co/hf-inference"
-
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json",
@@ -291,6 +289,7 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
 
     payload = {
         "model": "facebook/musicgen-small",
+        "task": "text-to-audio",
         "inputs": prompt,
         "parameters": {"duration": duration},
     }
@@ -302,20 +301,22 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
             print(f"[hf-musicgen] router returned {resp.status_code}: {resp.text[:300]}")
             return None
 
-        # direct audio bytes
+        # Direct audio bytes (router may return audio/wav)
         if "audio" in resp.headers.get("content-type", ""):
+            print("[hf-musicgen] router returned raw audio")
             return resp.content
 
-        # Sometimes router returns JSON with an audio URL
+        # Sometimes router returns JSON with an 'audio' or 'url' field
         try:
             data = resp.json()
             audio_url = data.get("audio") or data.get("url")
             if audio_url:
                 a = requests.get(audio_url, timeout=120)
                 if a.status_code == 200:
+                    print("[hf-musicgen] fetched audio from URL")
                     return a.content
-        except Exception:
-            pass
+        except Exception as e:
+            print("[hf-musicgen] JSON parse error:", e)
 
         print("[hf-musicgen] Unexpected response format.")
         return None
@@ -323,6 +324,7 @@ def call_hf_musicgen_safe(vocal_bytes: bytes, prompt: str, duration: int = 30) -
     except Exception as e:
         print("[hf-musicgen] Exception:", e)
         return None
+
 
 # =========================================================
 # MASTERING (remote → local fallback)
