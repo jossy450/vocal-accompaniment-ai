@@ -9,3 +9,7 @@ pretty_midi
 mido
 requests
 librosa
+audioread
+python-dotenv
+torch
+ffmpeg-python
