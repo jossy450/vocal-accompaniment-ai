@@ -1,6 +1,6 @@
 def generate_accompaniment_with_fallback(vocal_path, style, complexity, instruments, features, output_dir):
-    # TODO: connect to real model services
+    # TODO: call real model here
     import shutil
-    band_path = vocal_path.replace("vocal", "band")
-    shutil.copy(vocal_path, band_path)  # placeholder copy
+    band_path = vocal_path.replace("v", "b").replace("_", "_band_")
+    shutil.copy(vocal_path, band_path)
     return band_path
