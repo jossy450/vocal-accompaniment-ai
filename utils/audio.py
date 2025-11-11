@@ -1,5 +1,5 @@
 def extract_vocal_features(path):
-    # TODO: implement real extraction logic
+    # TODO: implement real feature extraction
     return {
         "tempo": 120,
         "key": "C",
