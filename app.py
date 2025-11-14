@@ -19,10 +19,16 @@ async def generate(
     temp_dir = f"temp/{session_id}"
     os.makedirs(temp_dir, exist_ok=True)
 
-    vocal_path = os.path.join(temp_dir, "vocal.wav")
-    with open(vocal_path, "wb") as f:
+    # Save uploaded file temporarily
+    original_path = os.path.join(temp_dir, vocal.filename)
+    with open(original_path, "wb") as f:
         shutil.copyfileobj(vocal.file, f)
 
+# Convert to WAV
+    vocal_path = os.path.join(temp_dir, "vocal.wav")
+    audio = AudioSegment.from_file(original_path)
+    audio.export(vocal_path, format="wav")
+    
     vocal_features = extract_vocal_features(vocal_path)
 
     try:
